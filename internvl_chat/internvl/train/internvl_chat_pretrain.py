@@ -61,6 +61,9 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
 
+from deepspeed.runtime.zero import GatheredParameters
+from peft import PeftModel
+
 # Try to import petrel_client for image loading, fallback to PIL if unavailable
 try:
     from petrel_client.client import Client
@@ -156,6 +159,10 @@ class ModelArguments:
     use_liger: bool = field(
         default=False,
         metadata={'help': 'Set to True to use the liger kernel.'}
+    )
+    load_lora_adapters: int = field(
+        default=0,
+        metadata={'help': 'User Lora Apaters saved with Checpoints'}
     )
 
 
@@ -445,12 +452,34 @@ class LazySupervisedDataset(Dataset):
         # Load the image using tcs_loader if available, otherwise use PIL
         if self.tcs_loader is not None and 's3://' in image_path:
             return self.tcs_loader(image_path)
-        return Image.open(image_path).convert('RGB')
+        
+        merged_image = Image.open(image_path).convert('RGB')
+        # Get full merged image size
+        merged_width, merged_height = merged_image.size
+
+        # Since it is a 1 x 4 image
+        single_width = merged_width // 4
+        single_height = merged_height
+
+        # Crop back into 4 original images
+        images_t = []
+
+        for t in range(4):
+            left = t * single_width
+            upper = 0
+            right = (t + 1) * single_width
+            lower = single_height
+
+            image_t = merged_image.crop((left, upper, right, lower))
+            images_t.append(image_t)
+
+        return images_t
 
     def get_image_path(self, image_path):
         if image_path.startswith('s3://'):  # for ceph
             image_path = self.root + image_path
         else:  # for local image
+            print("Root " + self.root)
             image_path = os.path.join(self.root, image_path)
         return image_path
 
@@ -521,11 +550,12 @@ class LazySupervisedDataset(Dataset):
 
         images, num_tiles = [], []
         num_image = len(data_item['image'])
-        for image_path in data_item['image']:
+        for i, image_path in enumerate(data_item['image']):
             # Merge the image path
-            image_path = self.get_image_path(image_path)
+            # image_path = self.get_image_path(image_path)
+            image_path = self.root + image_path
             # Load the image using tcs_loader if available, otherwise use PIL
-            image = self.load_image(image_path)
+            image = self.load_image(image_path)[i]
             if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
                 image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
                                            max_num=max(1, self.max_dynamic_patch // num_image),
@@ -839,6 +869,39 @@ def len2weight(x, loss_reduction):
     raise NotImplementedError(loss_reduction)
 
 
+from transformers import TrainerCallback
+class SaveAdaptersCallback(TrainerCallback):
+    def on_save(self, args, state, control, **kwargs):
+        model = kwargs["model"]
+        tokenizer = kwargs.get("tokenizer", None)
+
+        # Only rank 0 writes files
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return control
+
+        ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        # Save LLM LoRA
+        if hasattr(model, "language_model") and hasattr(model.language_model, "save_pretrained"):
+            model.language_model.save_pretrained(os.path.join(ckpt_dir, "llm_lora"))
+
+        # Save Vision LoRA (if you trained it)
+        if hasattr(model, "vision_model") and hasattr(model.vision_model, "save_pretrained"):
+            model.vision_model.save_pretrained(os.path.join(ckpt_dir, "vision_lora"))
+
+        # Save projector if trainable
+        if hasattr(model, "mlp1"):
+            torch.save(model.mlp1.state_dict(), os.path.join(ckpt_dir, "mlp1.pt"))
+
+        # Save tokenizer once (optional, but cheap)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(ckpt_dir)
+
+        print(f"[Checkpoint] Saved adapters at {ckpt_dir}")
+        return control
+
+
 def main():
     # Apply necessary patches for the transformers library
     replace_llama_rmsnorm_with_fused_rmsnorm()
@@ -951,7 +1014,22 @@ def main():
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
         model = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
+            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, cache_dir="/data/gpfs/projects/punim2030/huggingface/cache")
+        if model_args.load_lora_adapters:
+            model.language_model = PeftModel.from_pretrained(
+                model.language_model,
+                model_args.model_name_or_path + "/llm_lora",
+                is_trainable=True,
+            )
+            model.vision_model = PeftModel.from_pretrained(
+                model.vision_model,
+                model_args.model_name_or_path + "/vision_lora",
+                is_trainable=True,
+            )
+            model.train()
+            model.language_model.train()
+            model.vision_model.train()
+            model.language_model.enable_input_require_grads()
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
@@ -1000,9 +1078,11 @@ def main():
         logger.info(f'Resizing position embedding from '
                     f'{model.config.vision_config.image_size} '
                     f'to {data_args.force_image_size}...')
-        model.vision_model.resize_pos_embeddings(old_size=model.config.vision_config.image_size,
-                                                 new_size=data_args.force_image_size,
-                                                 patch_size=patch_size)
+        params = [model.vision_model.embeddings.position_embedding]
+        with GatheredParameters(params, modifier_rank=None):
+            model.vision_model.resize_pos_embeddings(old_size=model.config.vision_config.image_size,
+                                                    new_size=data_args.force_image_size,
+                                                    patch_size=patch_size)
         model.config.vision_config.image_size = data_args.force_image_size
     model.config.force_image_size = data_args.force_image_size
     model.num_image_token = int((data_args.force_image_size // patch_size) ** 2 * (data_args.down_sample_ratio ** 2))
@@ -1089,6 +1169,7 @@ def main():
         eval_dataset=None,
         tokenizer=tokenizer,
         data_collator=collator,
+        # callbacks=[SaveAdaptersCallback()]
     )
 
     # Training

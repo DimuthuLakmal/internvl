@@ -16,6 +16,7 @@ import random
 import shutil
 import sys
 import traceback
+from functools import partial
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, Literal, Optional
@@ -61,6 +62,8 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
 from trl import DPOConfig as DPOConfigTRL
+
+from deepspeed.runtime.zero import GatheredParameters
 
 # Try to import petrel_client for image loading, fallback to PIL if unavailable
 try:
@@ -461,7 +464,8 @@ class LazySupervisedDataset(Dataset):
         num_image = len(data_item['image'])
         for image_path in data_item['image']:
             # Merge the image path
-            image_path = self.get_image_path(image_path)
+            # image_path = self.get_image_path(image_path)
+            image_path = self.root + image_path
             # Load the image using tcs_loader if available, otherwise use PIL
             image = self.load_image(image_path)
             if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
@@ -482,45 +486,24 @@ class LazySupervisedDataset(Dataset):
 
         # Preprocess the conversations and generate the return dictionary
         num_image_tokens = [self.num_image_token * num_tile for num_tile in num_tiles]
+        ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
+                                  self.tokenizer, num_image_tokens, group_by_length=self.group_by_length,
+                                  use_packed_ds=False, ds_name=self.ds_name, num_image=num_image)
 
-        chosen_conversations = [
-            {'from': 'human', 'value': data_item['question']},
-            {'from': 'gpt', 'value': data_item['chosen']},
-        ]
-        chosen_ret = preprocess_function(
-            self.template_name,
-            [deepcopy(chosen_conversations)],
-            self.tokenizer,
-            num_image_tokens,
-            group_by_length=self.group_by_length,
-            ds_name=self.ds_name,
-            num_image=num_image,
-        )
-
-        rejected_conversations = [
-            {'from': 'human', 'value': data_item['question']},
-            {'from': 'gpt', 'value': data_item['rejected']},
-        ]
-        rejected_ret = preprocess_function(
-            self.template_name,
-            [deepcopy(rejected_conversations)],
-            self.tokenizer,
-            num_image_tokens,
-            group_by_length=self.group_by_length,
-            ds_name=self.ds_name,
-            num_image=num_image,
-        )
+        # Calculate position_ids for packed dataset
+        position_ids = ret['attention_mask'].long().cumsum(-1) - 1
+        position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
+        image_end_token_id = self.tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
+        assert (ret['input_ids'][0] == image_end_token_id).sum() == num_image, f'image tokens are truncated, this dataset is {self.ds_name}'
 
         # Create the final return dictionary
         ret = dict(
-            chosen_input_ids=chosen_ret['input_ids'][0],
-            chosen_labels=chosen_ret['labels'][0],
-            chosen_attention_mask=chosen_ret['attention_mask'][0],
-            rejected_input_ids=rejected_ret['input_ids'][0],
-            rejected_labels=rejected_ret['labels'][0],
-            rejected_attention_mask=rejected_ret['attention_mask'][0],
+            input_ids=ret['input_ids'][0],
+            labels=ret['labels'][0],
+            attention_mask=ret['attention_mask'][0],
+            position_ids=position_ids[0],
             pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
+            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
         )
         return ret
 
@@ -769,6 +752,18 @@ def build_datasets(
     return train_dataset
 
 
+def len2weight(x, loss_reduction):
+    if x == 0:
+        return x
+    if loss_reduction == 'token':
+        return 1
+    if loss_reduction == 'sample':
+        return 1 / x
+    if loss_reduction == 'square':
+        return 1 / (x ** 0.5)
+    raise NotImplementedError(loss_reduction)
+
+
 def main():
     # Apply necessary patches for the transformers library
     replace_llama_rmsnorm_with_fused_rmsnorm()
@@ -877,9 +872,9 @@ def main():
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
         model = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
-        ref_model = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
+            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, cache_dir="/data/gpfs/projects/punim2030/huggingface/cache")
+        # ref_model = InternVLChatModel.from_pretrained(
+        #     model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, cache_dir="/data/gpfs/projects/punim2030/huggingface/cache")
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
@@ -910,10 +905,10 @@ def main():
         logger.info('Building InternVLChatModel...')
         model = InternVLChatModel(internvl_chat_config, vision_model, llm)
     model.img_context_token_id = img_context_token_id
-    ref_model.img_context_token_id = img_context_token_id
+    # ref_model.img_context_token_id = img_context_token_id
 
     assert model.config.downsample_ratio == data_args.down_sample_ratio
-    assert ref_model.config.downsample_ratio == data_args.down_sample_ratio
+    # assert ref_model.config.downsample_ratio == data_args.down_sample_ratio
 
     if model_args.mlp_path is not None:
         logger.info('Loading pretrained MLP projector...')
@@ -930,15 +925,19 @@ def main():
         logger.info(f'Resizing position embedding from '
                     f'{model.config.vision_config.image_size} '
                     f'to {data_args.force_image_size}...')
-        model.vision_model.resize_pos_embeddings(old_size=model.config.vision_config.image_size,
-                                                 new_size=data_args.force_image_size,
-                                                 patch_size=patch_size)
+
+        params = [model.vision_model.embeddings.position_embedding]
+        with GatheredParameters(params, modifier_rank=None):
+            model.vision_model.resize_pos_embeddings(old_size=model.config.vision_config.image_size,
+                                                    new_size=data_args.force_image_size,
+                                                    patch_size=patch_size)
+
         model.config.vision_config.image_size = data_args.force_image_size
     model.config.force_image_size = data_args.force_image_size
     model.num_image_token = int((data_args.force_image_size // patch_size) ** 2 * (data_args.down_sample_ratio ** 2))
 
-    ref_model.config.force_image_size = model.config.force_image_size
-    ref_model.num_image_token = model.num_image_token
+    # ref_model.config.force_image_size = model.config.force_image_size
+    # ref_model.num_image_token = model.num_image_token
 
     if num_new_tokens > 0:
         model.language_model.resize_token_embeddings(len(tokenizer))
@@ -966,7 +965,7 @@ def main():
         for param in module.parameters():
             param.requires_grad = False
 
-    ref_model.eval()
+    # ref_model.eval()
     # _freeze_params(ref_model)
 
     if model_args.freeze_backbone:
@@ -1006,15 +1005,16 @@ def main():
     # set seed for torch dataloaders
     set_seed(training_args.seed)
 
-    trainer = MultimodalDPOTrainer(
-        model=model,
-        ref_model=ref_model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=None,
-        tokenizer=tokenizer,
-        data_collator=dpo_concat_pad_data_collator,
-    )
+    collator = concat_pad_data_collator
+
+    trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=None,
+            tokenizer=tokenizer,
+            data_collator=collator,
+        )
 
     # Training
     if training_args.do_train:

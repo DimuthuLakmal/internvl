@@ -376,8 +376,11 @@ class InternVisionModel(PreTrainedModel):
         self.encoder = InternVisionEncoder(config)
 
     def resize_pos_embeddings(self, old_size, new_size, patch_size):
+        self.embeddings.train()
         pos_emb = self.embeddings.position_embedding
-        _, num_positions, embed_dim = pos_emb.shape
+        # _, num_positions, embed_dim = pos_emb.shape
+        num_positions = self.embeddings.num_positions
+        embed_dim = self.embeddings.embed_dim
         cls_emb = pos_emb[:, :1, :]
         pos_emb = pos_emb[:, 1:, :].reshape(1, old_size // patch_size, old_size // patch_size, -1).permute(0, 3, 1, 2)
         pos_emb = F.interpolate(pos_emb.float(), size=new_size // patch_size, mode='bicubic', align_corners=False)

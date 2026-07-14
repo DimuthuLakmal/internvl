@@ -96,6 +96,41 @@ class MultimodalDPOTrainer(DPOTrainer):
 
         return concatenated_batch
 
+    def get_batch_logps(
+        self,
+        logits: torch.FloatTensor,
+        labels: torch.LongTensor,
+        label_pad_token_id: int = -100,
+        is_encoder_decoder: bool = False,
+    ) -> Tuple[torch.FloatTensor, torch.LongTensor]:
+        """Compute the log probabilities of the given labels under the given logits.
+
+        Args:
+            logits: Logits of the model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
+            labels: Labels for which to compute the log probabilities. Label tokens with a value of label_pad_token_id are ignored. Shape: (batch_size, sequence_length)
+            label_pad_token_id: The label pad token id.
+            is_encoder_decoder: Whether the model is an encoder-decoder model.
+
+        Returns:
+            A Tuple of two tensor of shape ((batch_size,), (batch_size,)) containing the sum of log probabilities of the given labels under the given logits in the first tensor and the number of non-masked tokens in the second tensor.
+        """
+        if logits.shape[:-1] != labels.shape:
+            raise ValueError(
+                f"Logits (batch and sequence length dim) {logits.shape[:-1]} and labels must have the same shape {labels.shape}."
+            )
+
+        if not is_encoder_decoder:
+            labels = labels[:, 1:].clone()
+            logits = logits[:, :-1, :]
+        loss_mask = labels != label_pad_token_id
+
+        # dummy token; we'll ignore the losses on these tokens later
+        labels[labels == label_pad_token_id] = 0
+
+        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+
+        return (per_token_logps * loss_mask).sum(-1), loss_mask.sum(-1)
+
     def concatenated_forward(
         self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:

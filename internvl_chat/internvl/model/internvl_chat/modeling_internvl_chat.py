@@ -6,6 +6,7 @@
 
 import warnings
 from typing import List, Optional, Tuple, Union
+import jsonlines
 
 import torch.distributed as dist
 import torch.utils.checkpoint
@@ -45,7 +46,7 @@ class InternVLChatModel(PreTrainedModel):
     _supports_flash_attn_2 = True
     supports_gradient_checkpointing = True
 
-    def __init__(self, config: InternVLChatConfig, vision_model=None, language_model=None, use_flash_attn=True):
+    def __init__(self, config: InternVLChatConfig, vision_model=None, language_model=None, use_flash_attn=True, system_message=None):
         super().__init__(config)
 
         assert version_cmp(transformers.__version__, '4.37.0', 'ge')
@@ -95,8 +96,8 @@ class InternVLChatModel(PreTrainedModel):
 
         self.img_context_token_id = None
         self.conv_template = get_conv_template(self.template)
-        if hasattr(config, 'system_message'):
-            self.system_message = config.system_message
+        if system_message is not None:
+            self.system_message = system_message
         else:
             self.system_message = self.conv_template.system_message
         self.num_samples = 0
@@ -156,13 +157,14 @@ class InternVLChatModel(PreTrainedModel):
             statistics: Optional[torch.LongTensor] = None,
             loss_weight: Optional[List] = None,
             loss_reduction_all_gather: Optional[bool] = False,
+            **kwargs
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         image_flags = image_flags.squeeze(-1)
         input_embeds = self.language_model.get_input_embeddings()(input_ids).clone()
 
-        vit_embeds = self.extract_feature(pixel_values)
+        vit_embeds = self.extract_feature(pixel_values).to(input_embeds.dtype)
         vit_embeds = vit_embeds[image_flags == 1]
         vit_batch_size = pixel_values.shape[0]
 
@@ -271,6 +273,14 @@ class InternVLChatModel(PreTrainedModel):
         return x
 
     def extract_feature(self, pixel_values):
+        def tensor_stats(x, name):
+            print(
+                f"{name}: shape={tuple(x.shape)}, dtype={x.dtype}, "
+                f"has_nan={torch.isnan(x).any().item()}, "
+                f"has_inf={torch.isinf(x).any().item()}, "
+                f"max_abs={torch.nan_to_num(x).abs().max().item():.6e}"
+            )
+            
         if self.select_layer == -1:
             vit_embeds = self.vision_model(
                 pixel_values=pixel_values,
@@ -287,6 +297,16 @@ class InternVLChatModel(PreTrainedModel):
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
         vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
+
+        # tensor_stats(vit_embeds, "before_mlp1")
+
+        # for name, p in self.mlp1.named_parameters():
+        #     if torch.isnan(p).any() or torch.isinf(p).any():
+        #         raise RuntimeError(f"Bad mlp1 param: {name}")
+
+        # with torch.autocast(device_type="cuda", enabled=False):
+        #     vit_embeds=self.mlp1(vit_embeds.float())
+
         vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
 
@@ -309,7 +329,7 @@ class InternVLChatModel(PreTrainedModel):
             print(f'dynamic ViT batch size: {image_bs}')
 
         queries = []
-        for idx, num_patches in enumerate(num_patches_list):
+        for idx, num_patches in enumerate(questions):
             question = questions[idx]
             if pixel_values is not None and '<image>' not in question:
                 question = '<image>\n' + question
@@ -319,8 +339,11 @@ class InternVLChatModel(PreTrainedModel):
             template.append_message(template.roles[1], None)
             query = template.get_prompt()
 
-            image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
-            query = query.replace('<image>', image_tokens, 1)
+            for num_patches in [1,1,1,1]:
+                image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
+                query = query.replace('<image>', image_tokens, 1)
+
+            # query = query.replace('<image>', image_tokens, 1)
             queries.append(query)
 
         tokenizer.padding_side = 'left'
@@ -336,13 +359,28 @@ class InternVLChatModel(PreTrainedModel):
             attention_mask=attention_mask,
             **generation_config
         )
-        responses = tokenizer.batch_decode(generation_output, skip_special_tokens=True)
+        # seq_end_lengths = (torch.where(generation_output['sequences'] == generation_config['eos_token_id'])[1] + 1).detach().cpu().numpy()
+
+        #seq_len
+        mask = generation_output['sequences'] == generation_config['eos_token_id']   # shape: (b, n)
+        # Does each row have at least one match?
+        has_match = mask.any(dim=1)   # shape: (b,)
+        # First True index in each row
+        idx = mask.float().argmax(dim=1) + 1   # shape: (b,)
+        # Replace rows with no match by fallback value n
+        n = generation_output['sequences'].size(1)
+        seq_end_lengths = torch.where(has_match, idx, torch.full_like(idx, n))
+
+        # if seq_end_lengths.shape[0] == 15:
+        #     print("Short one is dedected")
+        hidden_states = generation_output["hidden_states"]
+        responses = tokenizer.batch_decode(generation_output['sequences'], skip_special_tokens=True)
         responses = [response.split(template.sep.strip())[0].strip() for response in responses]
-        return responses
+        return responses, hidden_states, seq_end_lengths
 
     def chat(self, tokenizer, pixel_values, question, generation_config, history=None, return_history=False,
              num_patches_list=None, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>',
-             verbose=False):
+             verbose=False, save_logits=False):
 
         if history is None and pixel_values is not None and '<image>' not in question:
             question = '<image>\n' + question
@@ -370,7 +408,7 @@ class InternVLChatModel(PreTrainedModel):
             image_bs = pixel_values.shape[0]
             print(f'dynamic ViT batch size: {image_bs}')
 
-        for num_patches in num_patches_list:
+        for num_patches in [1,1,1,1]:
             image_tokens = IMG_START_TOKEN + IMG_CONTEXT_TOKEN * self.num_image_token * num_patches + IMG_END_TOKEN
             query = query.replace('<image>', image_tokens, 1)
 
@@ -385,6 +423,20 @@ class InternVLChatModel(PreTrainedModel):
             attention_mask=attention_mask,
             **generation_config
         )
+
+        scores = generation_output['scores']
+        probs = torch.stack([nn.functional.softmax(score, dim=-1) for score in scores]).squeeze()
+        all_top_logks, all_indices = torch.topk(probs, 10, dim=-1)
+        if save_logits:
+            save_logits_arr = []
+            for i, (word_top_logk, word_indice) in enumerate(zip(all_top_logks, all_indices)):
+                words_dict = {}
+                for j, (top_logk, indice) in enumerate(zip(word_top_logk, word_indice)):
+                    words_dict[indice.item()] = top_logk.item()
+                save_logits_arr.append(words_dict)
+                
+        hidden_states = generation_output['hidden_states']
+        generation_output = generation_output['sequences']
         response = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
         response = response.split(template.sep.strip())[0].strip()
         history.append((question, response))
@@ -395,7 +447,7 @@ class InternVLChatModel(PreTrainedModel):
             query_to_print = query_to_print.replace(f'{IMG_START_TOKEN}{IMG_END_TOKEN}', '<image>')
             if verbose:
                 print(query_to_print, response)
-            return response
+            return response, save_logits_arr, hidden_states
 
     @torch.no_grad()
     def generate(
@@ -433,7 +485,8 @@ class InternVLChatModel(PreTrainedModel):
             attention_mask=attention_mask,
             generation_config=generation_config,
             output_hidden_states=output_hidden_states,
-            use_cache=True,
+            use_cache=False,
+            synced_gpus=False,
             **generate_kwargs,
         )
 

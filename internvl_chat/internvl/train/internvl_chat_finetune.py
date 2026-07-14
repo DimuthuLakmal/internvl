@@ -480,7 +480,8 @@ class LazySupervisedDataset(Dataset):
         num_image = len(data_item['image'])
         for image_path in data_item['image']:
             # Merge the image path
-            image_path = self.get_image_path(image_path)
+            # image_path = self.get_image_path(image_path)
+            image_path = self.root + image_path
             # Load the image using tcs_loader if available, otherwise use PIL
             image = self.load_image(image_path)
             if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
@@ -907,7 +908,7 @@ def main():
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
         model = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config)
+            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, cache_dir="/data/gpfs/projects/punim2030/huggingface/cache")
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
