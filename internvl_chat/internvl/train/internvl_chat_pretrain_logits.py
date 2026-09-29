@@ -26,7 +26,7 @@ except:
 import torch
 import torch.distributed as dist
 import transformers
-from internvl.dist_utils import init_dist
+from internvl.utils.dist_utils import init_dist
 from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
 from internvl.model.internvl_chat import (InternVisionConfig,
                                           InternVisionModel,

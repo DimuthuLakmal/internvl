@@ -67,8 +67,12 @@ def load_model_and_tokenizer(args):
         )
     else:
         model = InternVLChatModel.from_pretrained(
-                    args.checkpoint, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16,
-                    load_in_8bit=args.load_in_8bit, load_in_4bit=args.load_in_4bit, **kwargs).eval()
+                    args.checkpoint, 
+                    low_cpu_mem_usage=True, 
+                    torch_dtype=torch.bfloat16,
+                    cache_dir="/data/gpfs/projects/punim2030/huggingface/cache",
+                    load_in_8bit=args.load_in_8bit, 
+                    load_in_4bit=args.load_in_4bit, **kwargs).eval()
     if not args.load_in_8bit and not args.load_in_4bit and not args.auto:
         model = model.cuda()
     return model, tokenizer

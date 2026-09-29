@@ -1,0 +1,1724 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": "${command:pickArgs}"
+        },
+        {
+            "name": "Python Debugger: Train MLLM KD InternVL Black Box",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "module": "torch.distributed.run",
+            "console": "integratedTerminal",
+            "args": ["--nproc_per_node", "4", 
+                    "internvl/train/internvl_chat_finetune.py",
+                    "--model_name_or_path", "OpenGVLab/InternVL2_5-8B",
+                    "--conv_style", "internvl2_5",
+                    "--use_fast_tokenizer", "False",
+                    "--output_dir", "./results",
+                    "--meta_path", "./data/meta.json",
+                    "--overwrite_output_dir", "True",
+                    "--force_image_size", "224",
+                    "--max_dynamic_patch", "6",
+                    "--down_sample_ratio", "0.5",
+                    "--drop_path_rate", "0.0",
+
+                    "--freeze_llm", "True",
+                    "--freeze_mlp", "True",
+                    "--freeze_backbone", "True",
+                    "--use_llm_lora", "16",
+                    "--vision_select_layer", "-1",
+
+                    "--dataloader_num_workers", "2",
+                    "--bf16", "True",
+
+                    "--num_train_epochs", "1",
+                    "--per_device_train_batch_size", "4",
+                    "--gradient_accumulation_steps", "2",
+
+                    "--evaluation_strategy", "no",
+                    "--save_strategy", "steps",
+                    "--save_steps", "200",
+                    "--save_total_limit", "1",
+
+                    "--learning_rate", "4e-5",
+                    "--weight_decay", "0.05",
+                    "--warmup_ratio", "0.03",
+                    "--lr_scheduler_type", "cosine",
+                    "--logging_steps", "1",
+
+                    "--max_seq_length", "8192",
+                    "--do_train", "True",
+
+                    "--grad_checkpoint", "True",
+                    "--group_by_length", "True",
+                    "--dynamic_image_size", "True",
+                    "--use_thumbnail", "True",
+                    "--ps_version", "v2"
+                ],
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch"
+            },
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+        },
+        {
+            "name": "Python Debugger: InternVL3 Finetune",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "module": "torch.distributed.run",
+            "console": "integratedTerminal",
+            "args": ["--nproc_per_node", "4", 
+                    "internvl/train/internvl_chat_finetune.py",
+                    "--model_name_or_path", "./results/results_pretrained_internvl3_stage_1",
+                    "--conv_style", "internvl2_5",
+                    "--use_fast_tokenizer", "False",
+                    "--output_dir", "./results/results_pretrained_internvl3_stage_2",
+                    "--meta_path", "./data/meta.json",
+                    "--overwrite_output_dir", "True",
+                    "--force_image_size", "56",
+                    "--down_sample_ratio", "0.5",
+                    "--drop_path_rate", "0.0",
+
+                    "--freeze_llm", "False",
+                    "--freeze_mlp", "False",
+                    "--freeze_backbone", "False",
+                    "--vision_select_layer", "-1",
+
+                    "--dataloader_num_workers", "4",
+                    "--bf16", "True",
+
+                    "--num_train_epochs", "1",
+                    "--per_device_train_batch_size", "1",
+                    "--gradient_accumulation_steps", "1",
+
+                    "--evaluation_strategy", "no",
+                    "--save_strategy", "steps",
+                    "--save_steps", "200",
+                    "--save_total_limit", "1",
+
+                    "--learning_rate", "4e-5",
+                    "--weight_decay", "0.05",
+                    "--warmup_ratio", "0.03",
+                    "--lr_scheduler_type", "cosine",
+                    "--logging_steps", "1",
+
+                    "--max_seq_length", "16384",
+                    "--do_train", "True",
+
+                    "--grad_checkpoint", "True",
+                    "--group_by_length", "True",
+                    "--dynamic_image_size", "True",
+                    "--use_thumbnail", "True",
+                    "--ps_version", "v2",
+                    "--deepspeed", "zero_stage1_config.json"
+                ],
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch"
+            },
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+        },
+        {
+            "name": "InternVL Stage-1 Pretrain",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain.py",
+              "--model_name_or_path", "OpenGVLab/InternVL2_5-8B",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_stage1",
+              "--meta_path", "./data/meta.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "224",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.0",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "True",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "True",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "7000",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "200",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "2e-4",
+              "--weight_decay", "0.05",
+              "--warmup_steps", "100",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "8192",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "8192",
+              "--max_buffer_size", "20",
+              "--log_freq", "1000",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True"
+            ]
+        },
+        {
+            "name": "InternVL Stage-1 Pretrain Target",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain_target.py",
+              "--model_name_or_path", "OpenGVLab/InternVL2_5-8B",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_stage1_target",
+              "--meta_path", "./data/meta_1b_target_pred.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "224",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.0",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "True",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "True",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "80000",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "1000",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "2e-4",
+              "--weight_decay", "0.05",
+              "--warmup_steps", "100",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "4096",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "4096",
+              "--max_buffer_size", "20",
+              "--log_freq", "1000",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True"
+            ]
+        },
+        {
+            "name": "InternVL Stage-1 20B Pretrain",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain.py",
+              "--model_name_or_path", "OpenGVLab/InternVL2_5-26B",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_stage1",
+              "--meta_path", "./data/meta.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "56",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.0",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "True",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "True",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "11000",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "1000",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "2e-4",
+              "--weight_decay", "0.05",
+              "--warmup_steps", "100",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "16384",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage3_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "16384",
+              "--max_buffer_size", "20",
+              "--log_freq", "1000",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True",
+
+            //   "--use_llm_lora", "16",
+              "--use_backbone_lora", "16"
+            ]
+        },
+        {
+            "name": "InternVL 2B Stage-1 Pretrain",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "2", 
+              "internvl/train/internvl_chat_pretrain.py",
+              "--model_name_or_path", "OpenGVLab/InternVL2_5-2B",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_1b_target_pred",
+              "--meta_path", "./data/meta_1b_target_pred.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "224",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.0",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "True",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "True",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "5500",
+      
+              "--per_device_train_batch_size", "2",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "100",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "2e-4",
+              "--weight_decay", "0.01",
+              "--warmup_steps", "100",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "16384",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "16384",
+              "--max_buffer_size", "20",
+              "--log_freq", "1000",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True"
+            ]
+        },
+        {
+            "name": "InternVL 2B Stage-1 Logits Pretrain",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain_logits.py",
+              "--model_name_or_path", "OpenGVLab/InternVL2_5-2B",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_1b_stage1_logits",
+              "--meta_path", "./data/meta_1b.json",
+              "--logits_path", "eval/traffic/logits/logits.pkl",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "224",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.0",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "True",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "True",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "7000",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "100",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "2e-5",
+              "--weight_decay", "0.01",
+              "--warmup_steps", "100",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "8192",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "8192",
+              "--max_buffer_size", "20",
+              "--log_freq", "1000",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True"
+            ]
+        },
+        {
+            "name": "InternVL Stage-1.5 Pretrain",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain.py",
+              "--model_name_or_path", "./results/results_pretrained_stage1",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_stage1_5",
+              "--meta_path", "./data/meta.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "224",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.1",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "True",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "False",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "7000",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "100",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "1e-5",
+              "--weight_decay", "0.05",
+              "--warmup_steps", "100",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "8192",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "8192",
+              "--max_buffer_size", "20",
+              "--log_freq", "100",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True"
+            ]
+        },
+        {
+            "name": "InternVL Stage-1.5 Pretrain Target",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain_target.py",
+              "--model_name_or_path", "./results/results_pretrained_stage1_target",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_stage1_5_target",
+              "--meta_path", "./data/meta_1b_target_pred.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "224",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.1",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "True",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "False",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "24500",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "500",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "1e-5",
+              "--weight_decay", "0.05",
+              "--warmup_steps", "100",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "4096",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "4096",
+              "--max_buffer_size", "20",
+              "--log_freq", "100",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True"
+            ]
+        },
+        {
+            "name": "InternVL 20B Stage-1.5 Pretrain",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain.py",
+              "--model_name_or_path", "./results/results_pretrained_stage1/checkpoint-5000",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_stage1_5",
+              "--meta_path", "./data/meta.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "56",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.4",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "True",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "False",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "6000",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "1000",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "1e-5",
+              "--weight_decay", "0.05",
+              "--warmup_steps", "100",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "16384",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage3_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "16384",
+              "--max_buffer_size", "20",
+              "--log_freq", "100",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True",
+
+              "--use_llm_lora", "16",
+              "--use_backbone_lora", "16"
+            ]
+        },
+        {
+            "name": "InternVL Stage-2 Pretrain",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain.py",
+              "--model_name_or_path", "./results/results_pretrained_stage2",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_stage2_v2",
+              "--meta_path", "./data/meta.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "224",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.1",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "False",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "False",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "6500",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "500",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "4e-5",
+              "--weight_decay", "0.05",
+              "--warmup_ratio", "0.03",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "8192",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "8192",
+              "--max_buffer_size", "20",
+              "--log_freq", "100",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True"
+            ]
+        },
+        {
+            "name": "InternVL Stage-2 Pretrain Target",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain.py",
+              "--model_name_or_path", "./results/results_pretrained_stage1_target",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_stage2_target",
+              "--meta_path", "./data/meta.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "224",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.1",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "False",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "False",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "23500",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "500",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "4e-5",
+              "--weight_decay", "0.05",
+              "--warmup_ratio", "0.03",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "8192",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "8192",
+              "--max_buffer_size", "20",
+              "--log_freq", "100",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True"
+            ]
+        },
+        {
+            "name": "InternVL Stage-2 1B Pretrain",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain.py",
+              "--model_name_or_path", "./results/results_pretrained_1b_stage1_kd",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_1b_stage2_kd",
+              "--meta_path", "./data/meta_1b.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "56",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.1",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "False",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "False",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "11000",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "100",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "4e-5",
+              "--weight_decay", "0.05",
+              "--warmup_ratio", "0.03",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "16384",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "16384",
+              "--max_buffer_size", "20",
+              "--log_freq", "100",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True"
+            ]
+        },
+        {
+            "name": "InternVL Stage-2 1B Pretrain Target",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain_target.py",
+              "--model_name_or_path", "./results/results_pretrained_stage2_logits",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_1b_stage2_target",
+              "--meta_path", "./data/meta_1b_target_pred.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "224",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.1",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "False",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "False",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "115000",
+      
+              "--per_device_train_batch_size", "2",
+             "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "100",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "4e-5",
+              "--weight_decay", "0.05",
+              "--warmup_ratio", "0.03",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "4096",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "4096",
+              "--max_buffer_size", "20",
+              "--log_freq", "100",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True"
+            ]
+        },
+        {
+            "name": "InternVL 20B Stage-2 Pretrain",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain.py",
+              "--model_name_or_path", "OpenGVLab/InternVL2_5-26B",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_20b_stage_2",
+              "--meta_path", "./data/meta.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "56",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.1",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "False",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "False",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "7000",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "500",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "2e-5",
+              "--weight_decay", "0.05",
+              "--warmup_ratio", "0.03",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "16384",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage3_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "16384",
+              "--max_buffer_size", "20",
+              "--log_freq", "100",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True",
+              
+              "--use_llm_lora", "16",
+              "--use_backbone_lora", "16"
+            ]
+        },
+        {
+            "name": "InternVL3 Stage-2 Pretrain",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain_internvl3.py",
+              "--model_name_or_path", "OpenGVLab/InternVL3-8B",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_internvl3",
+              "--meta_path", "./data/meta.json",
+              "--overwrite_output_dir", "True",
+      
+              "--force_image_size", "56",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.1",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "False",
+              "--freeze_mlp", "True",
+              "--freeze_backbone", "True",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "7000",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "100",
+              "--save_total_limit", "12",
+      
+              "--learning_rate", "2e-7",
+              "--weight_decay", "0.05",
+              "--warmup_ratio", "0.03",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "16384",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "16384",
+              "--max_buffer_size", "20",
+              "--log_freq", "100",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True",
+            ]
+        },
+        {
+            "name": "InternVL 1B Stage-2 Pretrain Logits",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+              "--nproc_per_node", "4", 
+              "internvl/train/internvl_chat_pretrain_logits.py",
+              "--model_name_or_path", "./results/results_pretrained_1b_stage1_logits/",
+      
+              "--conv_style", "internvl2_5",
+              "--use_fast_tokenizer", "False",
+      
+              "--output_dir", "./results/results_pretrained_stage2_logits",
+              "--meta_path", "./data/meta_1b.json",
+              "--overwrite_output_dir", "True",
+              "--logits_path", "eval/traffic/logits/logits.pkl",
+      
+              "--force_image_size", "224",
+              "--down_sample_ratio", "0.5",
+              "--drop_path_rate", "0.1",
+      
+              "--min_num_frame", "8",
+              "--max_num_frame", "32",
+      
+              "--freeze_llm", "False",
+              "--freeze_mlp", "False",
+              "--freeze_backbone", "False",
+      
+              "--vision_select_layer", "-1",
+              "--dataloader_num_workers", "8",
+      
+              "--bf16", "True",
+              "--max_steps", "7000",
+      
+              "--per_device_train_batch_size", "1",
+              "--gradient_accumulation_steps", "1",
+      
+              "--evaluation_strategy", "no",
+              "--save_strategy", "steps",
+              "--save_steps", "100",
+              "--save_total_limit", "1",
+      
+              "--learning_rate", "4e-5",
+              "--weight_decay", "0.01",
+              "--warmup_ratio", "0.03",
+              "--lr_scheduler_type", "cosine",
+      
+              "--logging_steps", "1",
+              "--max_seq_length", "8192",
+      
+              "--do_train", "True",
+              "--grad_checkpoint", "True",
+      
+              "--group_by_length", "False",
+              "--dynamic_image_size", "True",
+              "--use_thumbnail", "True",
+      
+              "--ps_version", "v2",
+      
+              "--deepspeed", "zero_stage1_config.json",
+              "--report_to", "tensorboard",
+      
+              "--use_packed_ds", "False",
+              "--num_images_expected", "48",
+              "--max_packed_tokens", "8192",
+              "--max_buffer_size", "20",
+              "--log_freq", "100",
+      
+              "--strict_mode", "False",
+              "--replacement", "False",
+              "--allow_overflow", "False",
+      
+              "--remove_unused_columns", "False",
+              "--loss_reduction", "square",
+              "--loss_reduction_all_gather", "True"
+            ]
+        },
+        {
+            "name": "InternVL 3.0 Pretrain MPO",
+      
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch",
+                "TF_CPP_MIN_LOG_LEVEL": "3"
+            },
+            "args": [
+                "--nproc_per_node", "4",
+                "internvl/train/internvl_chat_mpo_original.py",
+        
+                "--model_name_or_path", "OpenGVLab/InternVL3-8B-Instruct",
+                "--conv_style", "internvl2_5",
+                "--output_dir", "./results/results_pretrained_internvl3",
+                "--meta_path", "./data/meta_internvl3_8b.json",
+                "--overwrite_output_dir", "True",
+        
+                "--force_image_size", "56",
+                "--down_sample_ratio", "0.5",
+                "--drop_path_rate", "0.1",
+                "--pad2square", "False",
+
+                "--freeze_llm", "False",
+                "--freeze_mlp", "False",
+                "--freeze_backbone", "False",
+                "--vision_select_layer", "-1",
+                "--use_data_resampling", "False",
+
+                "--dataloader_num_workers", "4",
+                "--bf16", "True",
+
+                "--num_train_epochs", "1",
+                "--per_device_train_batch_size", "1",
+                "--gradient_accumulation_steps", "1",
+
+                "--evaluation_strategy", "no",
+                "--save_strategy", "steps",
+                "--save_steps", "100",
+                "--save_total_limit", "1",
+
+                "--learning_rate", "2e-7",
+                "--weight_decay", "0.05",
+                "--warmup_ratio", "0.03",
+                "--lr_scheduler_type", "cosine",
+
+                "--logging_steps", "1",
+                "--max_seq_length", "16384",
+                "--do_train", "True",
+                "--grad_checkpoint", "True",
+
+                "--group_by_length", "False",
+                "--dynamic_image_size", "True",
+                "--use_thumbnail", "True",
+                "--ps_version", "v2",
+
+                "--deepspeed", "zero_stage3_config_100b_1e8.json",
+
+                "--report_to", "tensorboard",
+                "--loss_type", "sigmoid,bco_pair",
+                "--sigmoid_loss_weight", "0.8",
+                "--bco_pair_loss_weight", "0.2",
+                "--rpo_alpha", "1",
+                "--use_liger", "True",
+
+                "--use_llm_lora", "16",
+                "--use_backbone_lora", "16"
+            ]
+        },
+        {
+            "name": "Python Debugger: Inference MLLM KD InternVL 2 Black Box",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "module": "torch.distributed.run",
+            "console": "integratedTerminal",
+            "args": ["--nproc_per_node", "4", 
+                    "eval/traffic/evaluate_traffic_multi_image.py",
+                    "--checkpoint", "./results/results_pretrained_stage2_logits",
+                    "--logits-path", "eval/traffic/results_2b/eval_results_224.json",
+                    "--num-workers", "4",
+                    "--temperature", "0.0",
+                    "--out-dir", "./eval/traffic/results",
+                    "--jsonl", "/data/gpfs/projects/punim2030/mllm/data/val_internvl_1b.jsonl",
+                    "--jsonl_gt", "/data/gpfs/projects/punim2030/mllm/data/all_data_internvl.jsonl",
+                    "--image_root", "/data/gpfs/projects/punim2030/mllm/data/internvl_maps",
+                    "--image_size", "224",
+                    "--seed", "42",
+                    "--max-num", "1",
+                    "--auto",
+                    "--dynamic",
+                ],
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch"
+            },
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+        },
+        {
+            "name": "Python Debugger: Generate Diffusion Model Inputs",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "module": "torch.distributed.run",
+            "console": "integratedTerminal",
+            "args": ["--nproc_per_node", "4", 
+                    "eval/traffic/generate_local_mllm_output.py",
+                    "--checkpoint", "./results/results_pretrained_stage2_logits",
+                    "--num-workers", "4",
+                    "--temperature", "0.0",
+                    "--out-dir", "./eval/traffic/diff_input",
+                    "--image_size", "224",
+                    "--seed", "42",
+                    "--max-num", "1",
+                    "--auto",
+                    "--dynamic",
+                ],
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch"
+            },
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+        },
+        {
+            "name": "Python Debugger: Inference MLLM KD InternVL 20B Black Box",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "module": "torch.distributed.run",
+            "console": "integratedTerminal",
+            "args": ["--nproc_per_node", "1", 
+                    "eval/traffic/evaluate_traffic_20b_deepseed.py",
+                    "--checkpoint", "./results/results_pretrained_20b_stage_2/checkpoint-5000",
+                    "--num-workers", "4",
+                    "--temperature", "0.0",
+                    "--out-dir", "./eval/traffic/results",
+                    "--jsonl", "/data/gpfs/projects/punim2030/mllm/data/val_internvl.jsonl",
+                    "--jsonl_gt", "/data/gpfs/projects/punim2030/mllm/data/all_data_internvl.jsonl",
+                    "--image_root", "/data/gpfs/projects/punim2030/mllm/data/internvl_maps",
+                    "--image_size", "56",
+                    "--seed", "42",
+                    "--max-num", "1",
+                    "--auto",
+                    "--dynamic",
+                ],
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch"
+            },
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+        },
+        {
+            "name": "Python Debugger: Inference MLLM KD InternVL 3 Black Box",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "module": "torch.distributed.run",
+            "console": "integratedTerminal",
+            "args": ["--nproc_per_node", "1", 
+                    "eval/traffic/evaluate_traffic_multi_image.py",
+                    "--checkpoint", "./results/results_pretrained_internvl3/checkpoint-6200",
+                    "--num-workers", "4",
+                    "--temperature", "0.0",
+                    "--out-dir", "./eval/traffic/results",
+                    "--jsonl", "/data/gpfs/projects/punim2030/mllm/data/val_internvl.jsonl",
+                    "--jsonl_gt", "/data/gpfs/projects/punim2030/mllm/data/all_data_internvl.jsonl",
+                    "--image_root", "/data/gpfs/projects/punim2030/mllm/data/internvl_maps",
+                    "--image_size", "56",
+                    "--seed", "42",
+                    "--max-num", "1",
+                    "--auto",
+                    "--dynamic",
+                ],
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CUDA_HOME": "/apps/easybuild-2022/easybuild/software/Core/CUDA/12.4.1",
+                "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                "MASTER_PORT": "34229",
+                "LAUNCHER": "pytorch"
+            },
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python",
+        },
+        {
+            "name": "Python Debugger: Replace label with 8B output",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "eval/traffic/process_output.py",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python"
+        },
+        {
+            "name": "Python Debugger: Create DPO dataset",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "eval/traffic/create_dpo_internvl3.py",
+            "justMyCode": false,
+            "python": "/data/gpfs/projects/punim2030/anaconda/envs/llm/bin/python"
+        },
+    ]
+}

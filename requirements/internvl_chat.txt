@@ -1,12 +1,15 @@
 accelerate<1
 bitsandbytes==0.42.0
+boto3
 decord
 deepspeed>=0.13.5
 einops==0.6.1
 einops-exts==0.0.4
 huggingface_hub
 imageio
+mlflow
 numpy==1.26.4
+nvidia-ml-py
 opencv-python
 orjson
 peft==0.10.0

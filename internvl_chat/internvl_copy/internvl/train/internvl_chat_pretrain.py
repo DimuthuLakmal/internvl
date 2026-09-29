@@ -4,21 +4,16 @@
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
 
-import warnings
-
-warnings.filterwarnings('ignore', category=FutureWarning)
-warnings.filterwarnings('ignore', category=DeprecationWarning)
-
 import logging
 import math
 import os
 import random
-import shutil
 import sys
 import traceback
-from functools import partial
+import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Dict, Literal, Optional
 
 import numpy as np
@@ -31,16 +26,19 @@ except:
 import torch
 import torch.distributed as dist
 import transformers
-from internvl.dist_utils import init_dist
+from internvl.utils.dist_utils import init_dist
 from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
 from internvl.model.internvl_chat import (InternVisionConfig,
                                           InternVisionModel,
                                           InternVLChatConfig,
                                           InternVLChatModel)
 from internvl.patch import (concat_pad_data_collator,
-                            dpo_concat_pad_data_collator,
+                            replace_internlm2_attention_class,
+                            replace_llama_attention_class,
                             replace_llama_rmsnorm_with_fused_rmsnorm,
-                            replace_train_sampler)
+                            replace_phi3_attention_class,
+                            replace_qwen2_attention_class,
+                            replace_train_dataloader, replace_train_sampler)
 from internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
                                       IMG_CONTEXT_TOKEN, IMG_END_TOKEN,
                                       IMG_START_TOKEN, QUAD_END_TOKEN,
@@ -48,11 +46,12 @@ from internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
                                       REF_START_TOKEN)
 from internvl.train.dataset import (ConcatDataset, TCSLoader,
                                     WeightedConcatDataset, build_transform,
+                                    check_conversations_repetition,
                                     dynamic_preprocess, preprocess,
                                     preprocess_internlm,
                                     preprocess_internvl2_5, preprocess_mpt,
                                     preprocess_phi3)
-from internvl.train.trainer_dpo import MultimodalDPOTrainer
+from internvl.train.dataset_packed import PackedDataset, packed_collate_fn
 from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
 from torch.utils.data import Dataset
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
@@ -61,9 +60,9 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
-from trl import DPOConfig as DPOConfigTRL
 
 from deepspeed.runtime.zero import GatheredParameters
+from peft import PeftModel
 
 # Try to import petrel_client for image loading, fallback to PIL if unavailable
 try:
@@ -161,6 +160,10 @@ class ModelArguments:
         default=False,
         metadata={'help': 'Set to True to use the liger kernel.'}
     )
+    load_lora_adapters: int = field(
+        default=0,
+        metadata={'help': 'User Lora Apaters saved with Checpoints'}
+    )
 
 
 @dataclass
@@ -228,21 +231,46 @@ class DataTrainingArguments:
         default='imagenet',
         metadata={'help': 'The normalization type for the image. Default is imagenet.'},
     )
-    sigmoid_loss_weight: float = field(
-        default=1.0,
-        metadata={'help': 'Loss weight for DPO loss. Default is 1.0'},
+    use_packed_ds: bool = field(
+        default=False,
+        metadata={'help': 'Whether to use packed dataset for efficient training. Default is False.'},
     )
-    bco_pair_loss_weight: float = field(
-        default=1.0,
-        metadata={'help': 'Loss weight for BCO loss. Default is 1.0'},
+    num_images_expected: int = field(
+        default=40,
+        metadata={'help': 'The maximum number of images per packed sample. Default is 40.'},
     )
-
-
-class DPOConfig(DPOConfigTRL):
-    loss_type: Literal[
-        'sigmoid', 'hinge', 'ipo', 'bco_pair', 'sppo_hard', 'nca_pair', 'robust', 'aot', 'aot_pair', 'exo_pair',
-        'sigmoid,bco_pair',
-    ] = 'sigmoid'
+    max_packed_tokens: int = field(
+        default=8192,
+        metadata={'help': 'The required token length of per packed sample. Default is 8192.'},
+    )
+    max_buffer_size: int = field(
+        default=20,
+        metadata={'help': 'The buffer size of the packed dataset. Default is 20.'},
+    )
+    log_freq: int = field(
+        default=1000,
+        metadata={'help': 'The log frequency of the packed dataset. Default is 1000.'},
+    )
+    strict_mode: bool = field(
+        default=True,
+        metadata={'help': 'Whether to pad the number of images to satisfy num_images_expected. Default is True.'},
+    )
+    replacement: bool = field(
+        default=False,
+        metadata={'help': 'Whether to restart the dataset after it is exhausted. Default is False.'},
+    )
+    allow_overflow: bool = field(
+        default=False,
+        metadata={'help': 'Whether to drop the sample over the specified max_packed_tokens. Default is False.'},
+    )
+    loss_reduction: str = field(
+        default='token',
+        metadata={'help': 'Loss reduction method. Default is token.'},
+    )
+    loss_reduction_all_gather: bool = field(
+        default=False,
+        metadata={'help': 'Whether to gather all during loss reduction. Default is False.'},
+    )
 
 
 class LazySupervisedDataset(Dataset):
@@ -269,6 +297,12 @@ class LazySupervisedDataset(Dataset):
         sampling_method='rand',  # for video data
         repeat_time=1,
         normalize_type='imagenet',
+        # hyperparameters for packed training
+        use_packed_ds=False,
+        data_rank=0,
+        data_world_size=1,
+        distributed_mode=False,
+        force_shuffle=False,
         random_seed=0,
     ):
         super(LazySupervisedDataset, self).__init__()
@@ -288,22 +322,77 @@ class LazySupervisedDataset(Dataset):
         self.min_num_frame = min_num_frame
         self.sampling_method = sampling_method
 
+        # hyperparameters for distributed training
+        self.use_packed_ds = use_packed_ds
+        self.data_rank = data_rank
+        self.data_world_size = data_world_size
+        self.worker_id = None
+        self.worker_state_key = None
+        self.worker_distributed = False
+        self.distributed_mode = distributed_mode
+        # hyperparameters for packed dataset
+        self.dataset_type = 'pair'
+        self.max_num_images = 1
+        self.max_tokens = tokenizer.model_max_length
+        self.force_shuffle = force_shuffle
+        # TODO: quick resume
+        self._state_dict = {}
+
         logger.info('Formatting inputs...Skip in lazy mode')
         assert meta['annotation'].endswith('jsonl'), f'annotation must be jsonl, but got {meta["annotation"]}'
 
-        with open(meta['annotation'], 'r') as f:
-            self.raw_data = f.readlines()
+        total_ranks = torch.distributed.get_world_size()
+        self.total_ranks = total_ranks
+        current_rank = torch.distributed.get_rank()
+
+        """
+        This section of the code is used to read hundreds of millions of data entries.
+        By using caching and splitting the data according to rank, it ensures fast reading
+        speed and prevents out-of-memory.
+        """
+        # Create a cache directory path
+        basename = os.path.basename(meta['annotation']).replace('.jsonl', '')
+        data_dir = os.path.join(os.path.dirname(meta['annotation']), f'{basename}_temp')
+        os.makedirs(data_dir, exist_ok=True)  # Create the cache directory if it does not exist
+        # Create a temporary path for the current rank
+        temp_path = os.path.join(data_dir, f'{basename}_{current_rank}_of_{total_ranks}.jsonl')
+
+        # Check if the temporary file for the current rank already exists
+        if os.path.exists(temp_path):
+            # If it exists, read the raw data from the file
+            with open(temp_path, 'r') as f:
+                self.raw_data = f.readlines()
+        else:
+            # If it does not exist, read the raw data from the original annotation file
+            with open(meta['annotation'], 'r') as f:
+                self.raw_data = f.readlines()
+
+            # Adjust the raw data based on the repeat_time parameter
             if repeat_time < 1:
-                # If repeat_time is less than 1, select a portion of the data
-                self.raw_data = random.sample(self.raw_data, k=int(len(self.raw_data) * repeat_time))
-            if repeat_time > 1:
-                repeat_time = int(repeat_time)
-                assert isinstance(repeat_time, int)
-                # Repeat the list if repeat_time is greater than 1
-                self.raw_data = self.raw_data * repeat_time
+                self.raw_data = self.raw_data[:int(len(self.raw_data) * repeat_time)]
+            else:
+                self.raw_data = self.raw_data * int(repeat_time)
+
+            # Calculate the total number of lines and distribute lines to each rank
+            total_lines = len(self.raw_data)
+            logger.info(f'total_ranks: {total_ranks}, current_rank: {current_rank}, total_lines: {total_lines}')
+            lines_per_rank = total_lines // total_ranks  # Number of lines each rank should process
+            lines_per_rank = max(1, lines_per_rank)
+
+            # Calculate the start and end line numbers for the current rank
+            start_line = lines_per_rank * current_rank  # Starting line for the current rank
+            end_line = start_line + lines_per_rank  # Ending line for the current rank
+
+            # Assign the appropriate lines to the current rank
+            self.raw_data = self.raw_data[start_line:end_line]
+
+            # Write the raw data for the current rank to the temporary file
+            with open(temp_path, 'w') as f:
+                f.writelines(self.raw_data)
 
         self.rng = np.random.default_rng(seed=random_seed)
-        self.rng.shuffle(self.raw_data)
+        if self.force_shuffle:
+            self.rng.shuffle(self.raw_data)
 
         self.root = meta['root']
         self.cached_data_dict = {}
@@ -315,6 +404,7 @@ class LazySupervisedDataset(Dataset):
         self.max_dynamic_patch = max_dynamic_patch
         self.normalize_type = normalize_type
 
+        assert not group_by_length
         # If the precomputed length does not exist, roughly estimate the length of
         # each sample to improve the efficiency of group_by_length.
         if self.group_by_length:
@@ -339,7 +429,10 @@ class LazySupervisedDataset(Dataset):
                 self.length.append(token_length)
 
     def __len__(self):
-        return len(self.raw_data)
+        if not self.use_packed_ds:
+            return len(self.raw_data) * self.total_ranks
+        else:
+            return len(self.raw_data)
 
     def get_preprocess_function(self):
         # Select the appropriate preprocessing function based on the template name
@@ -359,12 +452,34 @@ class LazySupervisedDataset(Dataset):
         # Load the image using tcs_loader if available, otherwise use PIL
         if self.tcs_loader is not None and 's3://' in image_path:
             return self.tcs_loader(image_path)
-        return Image.open(image_path).convert('RGB')
+        
+        merged_image = Image.open(image_path).convert('RGB')
+        # Get full merged image size
+        merged_width, merged_height = merged_image.size
+
+        # Since it is a 1 x 4 image
+        single_width = merged_width // 4
+        single_height = merged_height
+
+        # Crop back into 4 original images
+        images_t = []
+
+        for t in range(4):
+            left = t * single_width
+            upper = 0
+            right = (t + 1) * single_width
+            lower = single_height
+
+            image_t = merged_image.crop((left, upper, right, lower))
+            images_t.append(image_t)
+
+        return images_t
 
     def get_image_path(self, image_path):
         if image_path.startswith('s3://'):  # for ceph
             image_path = self.root + image_path
         else:  # for local image
+            print("Root " + self.root)
             image_path = os.path.join(self.root, image_path)
         return image_path
 
@@ -374,23 +489,13 @@ class LazySupervisedDataset(Dataset):
                                     pad2square=self.pad2square, normalize_type=self.normalize_type)
         return transform
 
-    @staticmethod
-    def get_longest_common_prefix_index(tensor1, tensor2):
-        min_len = min(len(tensor1), len(tensor2))
-
-        for i in range(min_len):
-            if tensor1[i] != tensor2[i]:
-                return i
-
-        return min_len
-
     def multi_modal_get_item(self, data_item):
         # Build transformation function
         transform = self.get_transform()
 
         # Ensure the first conversation contains an image placeholder
-        if '<image>' not in data_item['question']:
-            data_item['question'] = '<image>\n' + data_item['question']
+        if '<image>' not in data_item['conversations'][0]['value']:
+            data_item['conversations'][0]['value'] = '<image>\n' + data_item['conversations'][0]['value']
 
         # Merge the image path
         image_path = self.get_image_path(data_item['image'])
@@ -417,42 +522,25 @@ class LazySupervisedDataset(Dataset):
         preprocess_function = self.get_preprocess_function()
 
         # Preprocess the conversations and generate the return dictionary
-        chosen_conversations = [
-            {'from': 'human', 'value': data_item['question']},
-            {'from': 'gpt', 'value': data_item['chosen']},
-        ]
-        chosen_ret = preprocess_function(
-            self.template_name,
-            [deepcopy(chosen_conversations)],
-            self.tokenizer,
-            [self.num_image_token * num_patches],
-            group_by_length=True,
-            ds_name=self.ds_name,
-        )
+        ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
+                                  self.tokenizer, [self.num_image_token * num_patches],
+                                  group_by_length=self.group_by_length,
+                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name)
 
-        rejected_conversations = [
-            {'from': 'human', 'value': data_item['question']},
-            {'from': 'gpt', 'value': data_item['rejected']},
-        ]
-        rejected_ret = preprocess_function(
-            self.template_name,
-            [deepcopy(rejected_conversations)],
-            self.tokenizer,
-            [self.num_image_token * num_patches],
-            group_by_length=True,
-            ds_name=self.ds_name,
-        )
+        # Calculate position_ids for packed dataset
+        position_ids = ret['attention_mask'].long().cumsum(-1) - 1
+        position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
+        image_end_token_id = self.tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
+        assert (ret['input_ids'][0] == image_end_token_id).sum() == 1, f'image tokens are truncated, this dataset is {self.ds_name}'
 
         # Create the final return dictionary
         ret = dict(
-            chosen_input_ids=chosen_ret['input_ids'][0],
-            chosen_labels=chosen_ret['labels'][0],
-            chosen_attention_mask=chosen_ret['attention_mask'][0],
-            rejected_input_ids=rejected_ret['input_ids'][0],
-            rejected_labels=rejected_ret['labels'][0],
-            rejected_attention_mask=rejected_ret['attention_mask'][0],
+            input_ids=ret['input_ids'][0],
+            labels=ret['labels'][0],
+            attention_mask=ret['attention_mask'][0],
+            position_ids=position_ids[0],
             pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
+            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
         )
         return ret
 
@@ -462,12 +550,12 @@ class LazySupervisedDataset(Dataset):
 
         images, num_tiles = [], []
         num_image = len(data_item['image'])
-        for image_path in data_item['image']:
+        for i, image_path in enumerate(data_item['image']):
             # Merge the image path
             # image_path = self.get_image_path(image_path)
             image_path = self.root + image_path
             # Load the image using tcs_loader if available, otherwise use PIL
-            image = self.load_image(image_path)
+            image = self.load_image(image_path)[i]
             if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
                 image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
                                            max_num=max(1, self.max_dynamic_patch // num_image),
@@ -488,7 +576,7 @@ class LazySupervisedDataset(Dataset):
         num_image_tokens = [self.num_image_token * num_tile for num_tile in num_tiles]
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
                                   self.tokenizer, num_image_tokens, group_by_length=self.group_by_length,
-                                  use_packed_ds=False, ds_name=self.ds_name, num_image=num_image)
+                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name, num_image=num_image)
 
         # Calculate position_ids for packed dataset
         position_ids = ret['attention_mask'].long().cumsum(-1) - 1
@@ -512,8 +600,8 @@ class LazySupervisedDataset(Dataset):
         transform = self.get_transform()
 
         # Ensure the first conversation contains a video placeholder
-        if '<video>' not in data_item['question']:
-            data_item['question'] = '<video>\n' + data_item['question']
+        if '<video>' not in data_item['conversations'][0]['value']:
+            data_item['conversations'][0]['value'] = '<video>\n' + data_item['conversations'][0]['value']
 
         # Get the video file path
         video_file = data_item['video']
@@ -530,8 +618,9 @@ class LazySupervisedDataset(Dataset):
             clip=data_item.get('clip', None))
 
         # Generate special tokens for each video frame
-        special_tokens = '\n'.join(['Frame{}: <image>'.format(i + 1) for i in range(len(image_list))])
-        data_item['question'] = data_item['question'].replace('<video>\n', special_tokens)
+        special_tokens = '\n'.join(['Frame-{}: <image>'.format(i + 1) for i in range(len(image_list))])
+        data_item['conversations'][0]['value'] = data_item['conversations'][0]['value'].replace(
+            '<video>\n', special_tokens + '\n')
 
         # Transform each frame image and stack them into a tensor
         pixel_values = [transform(image) for image in image_list]
@@ -543,46 +632,22 @@ class LazySupervisedDataset(Dataset):
 
         # Preprocess the conversations and generate the return dictionary
         num_image_tokens = [self.num_image_token] * num_patches
+        ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
+                                  self.tokenizer, num_image_tokens, group_by_length=self.group_by_length,
+                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name, num_image=num_patches)
 
-        chosen_conversations = [
-            {'from': 'human', 'value': data_item['question']},
-            {'from': 'gpt', 'value': data_item['chosen']},
-        ]
-        chosen_ret = preprocess_function(
-            self.template_name,
-            [deepcopy(chosen_conversations)],
-            self.tokenizer,
-            num_image_tokens,
-            group_by_length=True,
-            use_packed_ds=self.use_packed_ds,
-            ds_name=self.ds_name,
-            num_image=num_patches,
-        )
+        # Calculate position_ids for packed dataset
+        position_ids = ret['attention_mask'].long().cumsum(-1) - 1
+        position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
 
-        rejected_conversations = [
-            {'from': 'human', 'value': data_item['question']},
-            {'from': 'gpt', 'value': data_item['rejected']},
-        ]
-        rejected_ret = preprocess_function(
-            self.template_name,
-            [deepcopy(rejected_conversations)],
-            self.tokenizer,
-            num_image_tokens,
-            group_by_length=True,
-            use_packed_ds=self.use_packed_ds,
-            ds_name=self.ds_name,
-            num_image=num_patches,
-        )
-
+        # Create the final return dictionary
         ret = dict(
-            chosen_input_ids=chosen_ret['input_ids'][0],
-            chosen_labels=chosen_ret['labels'][0],
-            chosen_attention_mask=chosen_ret['attention_mask'][0],
-            rejected_input_ids=rejected_ret['input_ids'][0],
-            rejected_labels=rejected_ret['labels'][0],
-            rejected_attention_mask=rejected_ret['attention_mask'][0],
+            input_ids=ret['input_ids'][0],
+            labels=ret['labels'][0],
+            attention_mask=ret['attention_mask'][0],
+            position_ids=position_ids[0],
             pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
+            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
         )
         return ret
 
@@ -609,49 +674,43 @@ class LazySupervisedDataset(Dataset):
         preprocess_function = self.get_preprocess_function()
 
         # Preprocess the conversations and generate the return dictionary
-        chosen_conversations = [
-            {'from': 'human', 'value': data_item['question']},
-            {'from': 'gpt', 'value': data_item['chosen']},
-        ]
-        chosen_ret = preprocess_function(
-            self.template_name,
-            [deepcopy(chosen_conversations)],
-            self.tokenizer,
-            [self.num_image_token * num_patches],
-            text_only=True,
-            group_by_length=True,
-            ds_name=self.ds_name,
-        )
+        ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
+                                  self.tokenizer, [self.num_image_token * num_patches], text_only=True,
+                                  group_by_length=self.group_by_length, use_packed_ds=self.use_packed_ds,
+                                  ds_name=self.ds_name)
 
-        rejected_conversations = [
-            {'from': 'human', 'value': data_item['question']},
-            {'from': 'gpt', 'value': data_item['rejected']},
-        ]
-        rejected_ret = preprocess_function(
-            self.template_name,
-            [deepcopy(rejected_conversations)],
-            self.tokenizer,
-            [self.num_image_token * num_patches],
-            text_only=True,
-            group_by_length=True,
-            ds_name=self.ds_name,
-        )
+        # Calculate position_ids for packed dataset
+        position_ids = ret['attention_mask'].long().cumsum(-1) - 1
+        position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
 
         # Create the final return dictionary
         ret = dict(
-            chosen_input_ids=chosen_ret['input_ids'][0],
-            chosen_labels=chosen_ret['labels'][0],
-            chosen_attention_mask=chosen_ret['attention_mask'][0],
-            rejected_input_ids=rejected_ret['input_ids'][0],
-            rejected_labels=rejected_ret['labels'][0],
-            rejected_attention_mask=rejected_ret['attention_mask'][0],
+            input_ids=ret['input_ids'][0],
+            labels=ret['labels'][0],
+            attention_mask=ret['attention_mask'][0],
+            position_ids=position_ids[0],
             pixel_values=pixel_values,
-            image_flags=torch.tensor([0] * num_patches, dtype=torch.long),
+            image_flags=torch.tensor([0] * num_patches, dtype=torch.long)
         )
         return ret
 
+    def _enable_worker_distributed(self):
+        if (
+            self.distributed_mode
+            and not self.worker_distributed
+            and self.worker_id is not None
+        ):
+            self.worker_distributed = True
+            num_worker_per_rank = self.num_workers // self.total_ranks
+            self.raw_data = self.raw_data[self.worker_id % num_worker_per_rank::num_worker_per_rank]
+            logger.info(f'worker_distributed is enabled, {self.num_workers=}, {len(self.raw_data)=}')
+
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        i = i % len(self.raw_data)
+        if i >= len(self.raw_data):
+            if self.use_packed_ds:
+                raise NotImplementedError
+            else:
+                i = i % len(self.raw_data)
 
         try_cnt, max_try = 0, 10
         while True:
@@ -659,6 +718,8 @@ class LazySupervisedDataset(Dataset):
                 raise StopIteration
             try:
                 data_item = json.loads(self.raw_data[i])
+                # conversations = data_item['conversations']
+                # check_conversations_repetition(conversations, repeat_threshold=0.4, ngram=10)
                 if 'image' in data_item and len(data_item['image']) != 0:
                     if type(data_item['image']) == list:
                         ret = self.multi_modal_multi_image_get_item(data_item)
@@ -691,6 +752,25 @@ class LazySupervisedDataset(Dataset):
                 i = random.randint(0, len(self.raw_data) - 1)
         return ret
 
+    def __iter__(self):
+        self._enable_worker_distributed()
+        start_idx = 0
+
+        assert self.worker_state_key is not None
+        if self.worker_state_key in self._state_dict and len(self._state_dict[self.worker_state_key]) > 0:
+            start_idx = self._state_dict[self.worker_state_key]['current_idx']
+
+            self._state_dict.pop(self.worker_state_key)
+
+        if self.worker_id == 0:
+            logger.info(
+                f'[{self.ds_name}] [Worker id {self.worker_id}] '
+                f'begin to iter with {start_idx=}'
+            )
+
+        for i in range(start_idx, len(self)):
+            yield self[i]
+
 
 def build_datasets(
     data_args,
@@ -708,6 +788,8 @@ def build_datasets(
 ):
     datasets = []
     lengths = []
+    data_rank = dist.get_rank()
+    data_world_size = dist.get_world_size()
     ds_collections = json.loads(open(data_args.meta_path).read())
     for ds_idx, ds_name in enumerate(ds_collections.keys()):
         repeat_time = ds_collections[ds_name]['repeat_time']
@@ -723,9 +805,9 @@ def build_datasets(
             ds_name=ds_name,
             num_image_token=model.num_image_token,
             image_size=data_args.force_image_size,
-            is_train=ds_collections[ds_name].get('data_augment', False),
+            is_train=ds_collections[ds_name]['data_augment'],
             pad2square=data_args.pad2square,
-            group_by_length=group_by_length,
+            group_by_length=group_by_length and not data_args.use_packed_ds,
             dynamic_image_size=dynamic_image_size,
             use_thumbnail=use_thumbnail,
             min_dynamic_patch=min_dynamic_patch,
@@ -734,6 +816,12 @@ def build_datasets(
             max_num_frame=max_num_frame,
             repeat_time=repeat_time,
             normalize_type=normalize_type,
+            # hyperparameters for packed training
+            use_packed_ds=data_args.use_packed_ds,
+            data_rank=data_rank,
+            data_world_size=data_world_size,
+            distributed_mode=data_args.use_packed_ds,
+            force_shuffle=data_args.use_packed_ds,
             random_seed=ds_idx,
         )
         logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
@@ -743,7 +831,24 @@ def build_datasets(
         else:
             lengths.append(len(dataset))
 
-    if data_args.use_data_resampling:
+    if data_args.use_packed_ds:
+        total_length = sum(lengths)
+        train_dataset = PackedDataset(
+            tokenizer=tokenizer,
+            data_rank=data_rank,
+            data_world_size=data_world_size,
+            datasets=datasets,
+            dataset_weight=[l / total_length for l in lengths],
+            num_images_expected=data_args.num_images_expected,
+            max_packed_tokens=data_args.max_packed_tokens,
+            max_buffer_size=data_args.max_buffer_size,
+            log_freq=data_args.log_freq,
+            strict_mode=data_args.strict_mode,
+            replacement=data_args.replacement,
+            allow_overflow=data_args.allow_overflow,
+            allow_deduplicated_ds_name=False,
+        )
+    elif data_args.use_data_resampling:
         total_length = sum(lengths)
         weights = [l / total_length for l in lengths]
         train_dataset = WeightedConcatDataset(datasets, weights)
@@ -764,17 +869,51 @@ def len2weight(x, loss_reduction):
     raise NotImplementedError(loss_reduction)
 
 
+from transformers import TrainerCallback
+class SaveAdaptersCallback(TrainerCallback):
+    def on_save(self, args, state, control, **kwargs):
+        model = kwargs["model"]
+        tokenizer = kwargs.get("tokenizer", None)
+
+        # Only rank 0 writes files
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return control
+
+        ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        # Save LLM LoRA
+        if hasattr(model, "language_model") and hasattr(model.language_model, "save_pretrained"):
+            model.language_model.save_pretrained(os.path.join(ckpt_dir, "llm_lora"))
+
+        # Save Vision LoRA (if you trained it)
+        if hasattr(model, "vision_model") and hasattr(model.vision_model, "save_pretrained"):
+            model.vision_model.save_pretrained(os.path.join(ckpt_dir, "vision_lora"))
+
+        # Save projector if trainable
+        if hasattr(model, "mlp1"):
+            torch.save(model.mlp1.state_dict(), os.path.join(ckpt_dir, "mlp1.pt"))
+
+        # Save tokenizer once (optional, but cheap)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(ckpt_dir)
+
+        print(f"[Checkpoint] Saved adapters at {ckpt_dir}")
+        return control
+
+
 def main():
     # Apply necessary patches for the transformers library
     replace_llama_rmsnorm_with_fused_rmsnorm()
     replace_train_sampler()
+    replace_train_dataloader()
 
     # Parse input arguments
     # See all possible arguments in src/transformers/training_args.py
     # If use DeepSpeed zero3, init_dist must before HfArgumentParser
     launcher = os.environ.get('LAUNCHER', 'slurm')
     init_dist(launcher=launcher, backend='nccl')
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, DPOConfig))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith('.json'):
         # If we pass only one argument to the script, and it's the path to a json file,
         # let's parse it to get our arguments.
@@ -782,10 +921,7 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    training_args.remove_unused_columns = False
-    training_args.gradient_checkpointing = model_args.grad_checkpoint
-    training_args.sigmoid_loss_weight = data_args.sigmoid_loss_weight
-    training_args.bco_pair_loss_weight = data_args.bco_pair_loss_weight
+    training_args.use_packed_ds = data_args.use_packed_ds
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
@@ -846,6 +982,12 @@ def main():
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None
 
+    if data_args.use_packed_ds:
+        replace_internlm2_attention_class()
+        replace_qwen2_attention_class()
+        replace_phi3_attention_class()
+        replace_llama_attention_class()
+
     if model_args.use_liger:
         from internvl.patch import apply_liger_kernel_to_internvit
         from liger_kernel.transformers import (apply_liger_kernel_to_llama,
@@ -873,8 +1015,21 @@ def main():
         config.max_dynamic_patch = data_args.max_dynamic_patch
         model = InternVLChatModel.from_pretrained(
             model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, cache_dir="/data/gpfs/projects/punim2030/huggingface/cache")
-        # ref_model = InternVLChatModel.from_pretrained(
-        #     model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, cache_dir="/data/gpfs/projects/punim2030/huggingface/cache")
+        if model_args.load_lora_adapters:
+            model.language_model = PeftModel.from_pretrained(
+                model.language_model,
+                model_args.model_name_or_path + "/llm_lora",
+                is_trainable=True,
+            )
+            model.vision_model = PeftModel.from_pretrained(
+                model.vision_model,
+                model_args.model_name_or_path + "/vision_lora",
+                is_trainable=True,
+            )
+            model.train()
+            model.language_model.train()
+            model.vision_model.train()
+            model.language_model.enable_input_require_grads()
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
@@ -905,10 +1060,8 @@ def main():
         logger.info('Building InternVLChatModel...')
         model = InternVLChatModel(internvl_chat_config, vision_model, llm)
     model.img_context_token_id = img_context_token_id
-    # ref_model.img_context_token_id = img_context_token_id
 
     assert model.config.downsample_ratio == data_args.down_sample_ratio
-    # assert ref_model.config.downsample_ratio == data_args.down_sample_ratio
 
     if model_args.mlp_path is not None:
         logger.info('Loading pretrained MLP projector...')
@@ -925,19 +1078,14 @@ def main():
         logger.info(f'Resizing position embedding from '
                     f'{model.config.vision_config.image_size} '
                     f'to {data_args.force_image_size}...')
-
         params = [model.vision_model.embeddings.position_embedding]
         with GatheredParameters(params, modifier_rank=None):
             model.vision_model.resize_pos_embeddings(old_size=model.config.vision_config.image_size,
                                                     new_size=data_args.force_image_size,
                                                     patch_size=patch_size)
-
         model.config.vision_config.image_size = data_args.force_image_size
     model.config.force_image_size = data_args.force_image_size
     model.num_image_token = int((data_args.force_image_size // patch_size) ** 2 * (data_args.down_sample_ratio ** 2))
-
-    # ref_model.config.force_image_size = model.config.force_image_size
-    # ref_model.num_image_token = model.num_image_token
 
     if num_new_tokens > 0:
         model.language_model.resize_token_embeddings(len(tokenizer))
@@ -964,9 +1112,6 @@ def main():
     def _freeze_params(module):
         for param in module.parameters():
             param.requires_grad = False
-
-    # ref_model.eval()
-    # _freeze_params(ref_model)
 
     if model_args.freeze_backbone:
         # model.vision_model = model.vision_model.eval()
@@ -1005,16 +1150,27 @@ def main():
     # set seed for torch dataloaders
     set_seed(training_args.seed)
 
-    collator = concat_pad_data_collator
+    if data_args.use_packed_ds:
+        collator = partial(
+            packed_collate_fn,
+            data_collator=concat_pad_data_collator,
+            max_item_length=data_args.max_packed_tokens if data_args.strict_mode else 0,
+            micro_num=training_args.train_batch_size,
+            len2weight=partial(len2weight, loss_reduction=data_args.loss_reduction),
+            loss_reduction_all_gather=data_args.loss_reduction_all_gather,
+        )
+    else:
+        collator = concat_pad_data_collator
 
     trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset if training_args.do_train else None,
-            eval_dataset=None,
-            tokenizer=tokenizer,
-            data_collator=collator,
-        )
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=None,
+        tokenizer=tokenizer,
+        data_collator=collator,
+        # callbacks=[SaveAdaptersCallback()]
+    )
 
     # Training
     if training_args.do_train:
@@ -1023,7 +1179,6 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
-        print(f'[Memory Usage before training] {torch.cuda.memory_allocated()/1024/1024/1024:.2f}GB')
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()  # Saves the tokenizer too for easy upload
 
@@ -1036,20 +1191,6 @@ def main():
         trainer.log_metrics('train', metrics)
         trainer.save_metrics('train', metrics)
         trainer.save_state()
-
-        model_dir = model_args.model_name_or_path
-        output_dir = training_args.output_dir
-        for filename in [
-            'conversation.py',
-            'modeling_internvl_chat.py',
-            'modeling_intern_vit.py',
-            'modeling_internlm2.py',
-            'configuration_internvl_chat.py',
-            'configuration_intern_vit.py',
-            'configuration_internlm2.py',
-        ]:
-            if os.path.exists(os.path.join(model_dir, filename)):
-                shutil.copy(os.path.join(model_dir, filename), output_dir)
 
 
 if __name__ == '__main__':

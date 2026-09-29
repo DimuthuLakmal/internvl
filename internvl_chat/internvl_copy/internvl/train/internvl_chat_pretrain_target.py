@@ -17,21 +17,21 @@ from functools import partial
 from typing import Dict, Literal, Optional
 
 import numpy as np
-
-try:
-    import orjson as json
-except:
-    import json
+import json
 
 import torch
 import torch.distributed as dist
 import transformers
-from internvl.dist_utils import init_dist
+from internvl.utils.dist_utils import init_dist
 from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
 from internvl.model.internvl_chat import (InternVisionConfig,
                                           InternVisionModel,
                                           InternVLChatConfig,
                                           InternVLChatModel)
+from internvl.model.goal_predictor.mllm_spatial_goal_predictor import MLLMGoalPredictor
+from internvl.model.goal_predictor.checkpoint_io import (load_goal_predictor_checkpoint,
+                                                          load_llm_checkpoint)
+from internvl.train.target_trainer import TargetSFTTrainer
 from internvl.patch import (concat_pad_data_collator,
                             replace_internlm2_attention_class,
                             replace_llama_attention_class,
@@ -49,7 +49,7 @@ from internvl.train.dataset import (ConcatDataset, TCSLoader,
                                     check_conversations_repetition,
                                     dynamic_preprocess, preprocess,
                                     preprocess_internlm,
-                                    preprocess_internvl2_5, preprocess_mpt,
+                                    preprocess_internvl2_5, preprocess_mpt, preprocess_internvl2_5_target,
                                     preprocess_phi3)
 from internvl.train.dataset_packed import PackedDataset, packed_collate_fn
 from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
@@ -60,12 +60,9 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
-from trl import DPOConfig as DPOConfigTRL
 
 from deepspeed.runtime.zero import GatheredParameters
-
-from transformers import BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import PeftModel
 
 # Try to import petrel_client for image loading, fallback to PIL if unavailable
 try:
@@ -163,21 +160,9 @@ class ModelArguments:
         default=False,
         metadata={'help': 'Set to True to use the liger kernel.'}
     )
-    use_4bit: bool = field(
-        default=False,
-        metadata={'help': 'Enable 4-bit quantized loading for QLoRA.'},
-    )
-    use_8bit: bool = field(
-        default=False,
-        metadata={'help': 'Enable 8-bit quantized loading (less compression than 4-bit).'},
-    )
-    bnb_4bit_quant_type: str = field(
-        default="nf4",
-        metadata={'help': '4-bit quant type: nf4 or fp4 (nf4 recommended).'},
-    )
-    bnb_4bit_use_double_quant: bool = field(
-        default=False,
-        metadata={'help': 'Use double quantization (usually helps memory/quality).'},
+    load_lora_adapters: int = field(
+        default=0,
+        metadata={'help': 'User Lora Apaters saved with Checpoints'}
     )
 
 
@@ -285,6 +270,10 @@ class DataTrainingArguments:
     loss_reduction_all_gather: bool = field(
         default=False,
         metadata={'help': 'Whether to gather all during loss reduction. Default is False.'},
+    )
+    load_checkpoint: bool = field(
+        default=False,
+        metadata={'help': 'Whether the MLLM Goal Predictor is loaded'},
     )
 
 
@@ -458,7 +447,7 @@ class LazySupervisedDataset(Dataset):
         elif self.template_name == 'phi3-chat':
             preprocess_function = preprocess_phi3
         elif self.template_name == 'internvl2_5':
-            preprocess_function = preprocess_internvl2_5
+            preprocess_function = preprocess_internvl2_5_target
         else:
             preprocess_function = preprocess
         return preprocess_function
@@ -467,7 +456,28 @@ class LazySupervisedDataset(Dataset):
         # Load the image using tcs_loader if available, otherwise use PIL
         if self.tcs_loader is not None and 's3://' in image_path:
             return self.tcs_loader(image_path)
-        return Image.open(image_path).convert('RGB')
+        
+        merged_image = Image.open(image_path).convert('RGB')
+        # Get full merged image size
+        merged_width, merged_height = merged_image.size
+
+        # Since it is a 1 x 4 image
+        single_width = merged_width // 4
+        single_height = merged_height
+
+        # Crop back into 4 original images
+        images_t = []
+
+        for t in range(4):
+            left = t * single_width
+            upper = 0
+            right = (t + 1) * single_width
+            lower = single_height
+
+            image_t = merged_image.crop((left, upper, right, lower))
+            images_t.append(image_t)
+
+        return images_t
 
     def get_image_path(self, image_path):
         if image_path.startswith('s3://'):  # for ceph
@@ -530,7 +540,7 @@ class LazySupervisedDataset(Dataset):
         # Create the final return dictionary
         ret = dict(
             input_ids=ret['input_ids'][0],
-            labels=ret['labels'][0],
+            labels=None,
             attention_mask=ret['attention_mask'][0],
             position_ids=position_ids[0],
             pixel_values=pixel_values,
@@ -544,12 +554,12 @@ class LazySupervisedDataset(Dataset):
 
         images, num_tiles = [], []
         num_image = len(data_item['image'])
-        for image_path in data_item['image']:
+        for i, image_path in enumerate(data_item['image']):
             # Merge the image path
             # image_path = self.get_image_path(image_path)
             image_path = self.root + image_path
             # Load the image using tcs_loader if available, otherwise use PIL
-            image = self.load_image(image_path)
+            image = self.load_image(image_path)[i]
             if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
                 image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
                                            max_num=max(1, self.max_dynamic_patch // num_image),
@@ -584,107 +594,9 @@ class LazySupervisedDataset(Dataset):
             labels=ret['labels'][0],
             attention_mask=ret['attention_mask'][0],
             position_ids=position_ids[0],
+            raw_labels=ret['raw_labels'][0],
             pixel_values=pixel_values,
             image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
-        )
-        return ret
-
-    def video_get_item(self, data_item):
-        # Build transformation function
-        transform = self.get_transform()
-
-        # Ensure the first conversation contains a video placeholder
-        if '<video>' not in data_item['conversations'][0]['value']:
-            data_item['conversations'][0]['value'] = '<video>\n' + data_item['conversations'][0]['value']
-
-        # Get the video file path
-        video_file = data_item['video']
-        video_path = os.path.join(self.root, video_file)
-
-        # Load the video frames using tcs_loader
-        # TODO: Load videos without using tcsloader.
-        image_list = self.tcs_loader(
-            video_path,
-            image_type='video',
-            max_num_frames=self.max_num_frame,
-            min_num_frames=self.min_num_frame,
-            sample=self.sampling_method,
-            clip=data_item.get('clip', None))
-
-        # Generate special tokens for each video frame
-        special_tokens = '\n'.join(['Frame-{}: <image>'.format(i + 1) for i in range(len(image_list))])
-        data_item['conversations'][0]['value'] = data_item['conversations'][0]['value'].replace(
-            '<video>\n', special_tokens + '\n')
-
-        # Transform each frame image and stack them into a tensor
-        pixel_values = [transform(image) for image in image_list]
-        pixel_values = torch.stack(pixel_values)
-        num_patches = pixel_values.size(0)
-
-        # Select the appropriate preprocessing function based on the template name
-        preprocess_function = self.get_preprocess_function()
-
-        # Preprocess the conversations and generate the return dictionary
-        num_image_tokens = [self.num_image_token] * num_patches
-        ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
-                                  self.tokenizer, num_image_tokens, group_by_length=self.group_by_length,
-                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name, num_image=num_patches)
-
-        # Calculate position_ids for packed dataset
-        position_ids = ret['attention_mask'].long().cumsum(-1) - 1
-        position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
-
-        # Create the final return dictionary
-        ret = dict(
-            input_ids=ret['input_ids'][0],
-            labels=ret['labels'][0],
-            attention_mask=ret['attention_mask'][0],
-            position_ids=position_ids[0],
-            pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
-        )
-        return ret
-
-    def pure_text_get_item(self, data_item):
-        # Build transformation function
-        transform = self.get_transform()
-
-        # Create a blank white image
-        image = Image.new('RGB', (224, 224), (255, 255, 255))
-
-        # Dynamically preprocess the image to generate patches
-        images = dynamic_preprocess(image, min_num=self.min_dynamic_patch, max_num=1,
-                                    image_size=self.image_size, use_thumbnail=self.use_thumbnail)
-
-        # Apply the transformation to each image patch and stack them into a tensor
-        pixel_values = [transform(image) for image in images]
-        pixel_values = torch.stack(pixel_values)
-        num_patches = pixel_values.size(0)
-
-        # Ensure there is only one patch
-        assert num_patches == 1, f'The number of patches should be 1, but got {num_patches}.'
-
-        # Select the appropriate preprocessing function based on the template name
-        preprocess_function = self.get_preprocess_function()
-
-        # Preprocess the conversations and generate the return dictionary
-        ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
-                                  self.tokenizer, [self.num_image_token * num_patches], text_only=True,
-                                  group_by_length=self.group_by_length, use_packed_ds=self.use_packed_ds,
-                                  ds_name=self.ds_name)
-
-        # Calculate position_ids for packed dataset
-        position_ids = ret['attention_mask'].long().cumsum(-1) - 1
-        position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
-
-        # Create the final return dictionary
-        ret = dict(
-            input_ids=ret['input_ids'][0],
-            labels=ret['labels'][0],
-            attention_mask=ret['attention_mask'][0],
-            position_ids=position_ids[0],
-            pixel_values=pixel_values,
-            image_flags=torch.tensor([0] * num_patches, dtype=torch.long)
         )
         return ret
 
@@ -719,10 +631,6 @@ class LazySupervisedDataset(Dataset):
                         ret = self.multi_modal_multi_image_get_item(data_item)
                     else:
                         ret = self.multi_modal_get_item(data_item)
-                elif 'video' in data_item and data_item['video'] is not None and data_item['video'] != '':
-                    ret = self.video_get_item(data_item)
-                else:
-                    ret = self.pure_text_get_item(data_item)
                 break
             except Exception as e:
                 try_cnt += 1
@@ -740,9 +648,6 @@ class LazySupervisedDataset(Dataset):
                         else:
                             data_path = os.path.join(self.root, data_item['image'])
                         print(f'Failed to load image: {data_path}, the dataset is: {self.ds_name}')
-                elif 'video' in data_item:
-                    data_path = os.path.join(self.root, data_item['video'])
-                    print(f'Failed to load video: {data_path}, the dataset is: {self.ds_name}')
                 i = random.randint(0, len(self.raw_data) - 1)
         return ret
 
@@ -863,44 +768,6 @@ def len2weight(x, loss_reduction):
     raise NotImplementedError(loss_reduction)
 
 
-def find_lora_targets(model, wanted_suffixes, max_print=200):
-    import re
-    import torch.nn as nn
-
-    hits = []
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            for suf in wanted_suffixes:
-                if name.endswith(suf):
-                    hits.append(name)
-                    break
-    # Print a sample so you can verify
-    print(f"[LoRA] Found {len(hits)} Linear modules matching suffixes.")
-    for n in hits[:max_print]:
-        print("  ", n)
-    return hits
-
-
-def save_adapters_only(mm_model, tokenizer, output_dir): 
-    print("At the beginning!!!")
-    if dist.get_rank() != 0:
-        return
-    os.makedirs(output_dir, exist_ok=True)
-    print("Reached this point!!!")
-
-    # LLM LoRA
-    if hasattr(mm_model, "language_model") and hasattr(mm_model.language_model, "save_pretrained"):
-        mm_model.language_model.save_pretrained(os.path.join(output_dir, "llm_lora"))
-
-    # Vision LoRA (if you used it)
-    if hasattr(mm_model, "vision_model") and hasattr(mm_model.vision_model, "save_pretrained"):
-        mm_model.vision_model.save_pretrained(os.path.join(output_dir, "vision_lora"))
-
-    # Projector (if you trained it, otherwise skip)
-    torch.save(mm_model.mlp1.state_dict(), os.path.join(output_dir, "mlp1.pt"))
-
-    tokenizer.save_pretrained(output_dir)
-
 from transformers import TrainerCallback
 class SaveAdaptersCallback(TrainerCallback):
     def on_save(self, args, state, control, **kwargs):
@@ -932,6 +799,125 @@ class SaveAdaptersCallback(TrainerCallback):
 
         print(f"[Checkpoint] Saved adapters at {ckpt_dir}")
         return control
+
+
+def load_llm_checkpoint(
+    checkpoint_dir: str,
+    torch_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cpu",
+):
+    internvl_dir = os.path.join(
+        checkpoint_dir,
+        "internvl_model",
+    )
+    # -------------------------------------------------------------
+    # 1. Load tokenizer and InternVL
+    # -------------------------------------------------------------
+    # tokenizer = AutoTokenizer.from_pretrained(
+    #     internvl_dir,
+    #     trust_remote_code=True,
+    #     use_fast=False,
+    # )
+
+    internvl_model = InternVLChatModel.from_pretrained(
+        internvl_dir,
+        torch_dtype=torch_dtype,
+        trust_remote_code=True,
+    )
+
+    return internvl_model
+
+
+def load_goal_predictor_checkpoint(
+    checkpoint_dir: str,
+    internvl_model: InternVLChatModel,
+    tokenizer: AutoTokenizer,
+    device: str = "cpu",
+):
+    predictor_dir = os.path.join(
+        checkpoint_dir,
+        "goal_predictor",
+    )
+
+    predictor_config_path = os.path.join(
+        predictor_dir,
+        "goal_predictor_config.json",
+    )
+
+    predictor_weights_path = os.path.join(
+        predictor_dir,
+        "goal_predictor_weights.pt",
+    )
+
+    required_paths = [
+        predictor_config_path,
+        predictor_weights_path,
+    ]
+
+    for path in required_paths:
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Required checkpoint component was not found: {path}"
+            )
+
+
+    # -------------------------------------------------------------
+    # 2. Reconstruct MLLMGoalPredictor
+    # -------------------------------------------------------------
+    with open(
+        predictor_config_path,
+        "r",
+        encoding="utf-8",
+    ) as file:
+        predictor_config = json.load(file)
+
+    goal_model = MLLMGoalPredictor(
+        **predictor_config,
+        llm_model=internvl_model,
+        llm_tokenizer=tokenizer,
+    )
+
+    # -------------------------------------------------------------
+    # 3. Load only the predictor-specific parameters
+    # -------------------------------------------------------------
+    try:
+        predictor_state_dict = torch.load(
+            predictor_weights_path,
+            # map_location="cpu",
+            weights_only=True,
+        )
+    except TypeError:
+        # Compatibility with older PyTorch releases.
+        predictor_state_dict = torch.load(
+            predictor_weights_path,
+            # map_location="cpu",
+        )
+
+    incompatible = goal_model.load_state_dict(
+        predictor_state_dict,
+        strict=False,
+    )
+
+    # llm_model.* is deliberately absent from predictor_weights.pt.
+    invalid_missing_keys = [
+        key
+        for key in incompatible.missing_keys
+        if not key.startswith("llm_model.")
+    ]
+
+    if invalid_missing_keys:
+        raise RuntimeError(
+            "Predictor checkpoint is missing non-InternVL parameters:\n"
+            + "\n".join(invalid_missing_keys)
+        )
+
+    if incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Unexpected predictor checkpoint parameters:\n"
+            + "\n".join(incompatible.unexpected_keys)
+        )
+
+    return goal_model
 
 
 def main():
@@ -1002,6 +988,11 @@ def main():
 
     # Load pretrained model, tokenizer, and image processor
     tokenizer_path = model_args.model_name_or_path or model_args.llm_path
+
+    # If loaded from local path
+    if data_args.load_checkpoint:
+        tokenizer_path = os.path.join(tokenizer_path, "internvl_model")
+
     logger.info(f'Loading Tokenizer: {tokenizer_path}')
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path, add_eos_token=False, trust_remote_code=True, use_fast=model_args.use_fast_tokenizer)
@@ -1030,7 +1021,13 @@ def main():
 
     if model_args.model_name_or_path is not None:
         logger.info('Loading InternVLChatModel...')
-        config = InternVLChatConfig.from_pretrained(model_args.model_name_or_path)
+            # If loaded from local path
+
+        config_path = model_args.model_name_or_path
+        if data_args.load_checkpoint:
+            config_path = os.path.join(model_args.model_name_or_path, "internvl_model")
+
+        config = InternVLChatConfig.from_pretrained(config_path)
         config.vision_config.drop_path_rate = model_args.drop_path_rate
         if config.llm_config.model_type == 'internlm2':
             config.llm_config.attn_implementation = 'flash_attention_2'  # for InternLM
@@ -1046,20 +1043,26 @@ def main():
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
 
-        #Quantization
-        quantization_config = None
-        if model_args.use_4bit or model_args.use_8bit:
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=model_args.use_4bit,
-                load_in_8bit=model_args.use_8bit,
-                bnb_4bit_quant_type=model_args.bnb_4bit_quant_type,
-                bnb_4bit_use_double_quant=model_args.bnb_4bit_use_double_quant,
-                bnb_4bit_compute_dtype=torch.bfloat16,   # good default on A100/H100, etc.
-            )
-
-        model = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, cache_dir="/data/gpfs/projects/punim2030/huggingface/cache",
-            quantization_config=quantization_config)
+        if data_args.load_checkpoint:
+            model = load_llm_checkpoint(model_args.model_name_or_path)
+        else:
+            model = InternVLChatModel.from_pretrained(
+                model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config, cache_dir="/data/gpfs/projects/punim2030/huggingface/cache")
+            if model_args.load_lora_adapters:
+                model.language_model = PeftModel.from_pretrained(
+                    model.language_model,
+                    model_args.model_name_or_path + "/llm_lora",
+                    is_trainable=True,
+                )
+                model.vision_model = PeftModel.from_pretrained(
+                    model.vision_model,
+                    model_args.model_name_or_path + "/vision_lora",
+                    is_trainable=True,
+                )
+                model.train()
+                model.language_model.train()
+                model.vision_model.train()
+                model.language_model.enable_input_require_grads()
     else:
         logger.info('Loading ViT-6B...')
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
@@ -1164,8 +1167,6 @@ def main():
 
     if model_args.freeze_mlp:
         _freeze_params(model.mlp1)
-    
-    # model.mlp1 = model.mlp1.float()
 
     if model_args.unfreeze_vit_layers != 0:
         layers = model.vision_model.encoder.layers[model_args.unfreeze_vit_layers:]
@@ -1194,14 +1195,29 @@ def main():
     else:
         collator = concat_pad_data_collator
 
-    trainer = Trainer(
-        model=model,
+    # Initialing SpatialPlanner
+    if not data_args.load_checkpoint:
+        goal_model = MLLMGoalPredictor(
+                mllm_hidden_dim=4096,
+                feat_dim=2048,
+                attn_dim=256,
+                num_sections=4,
+                map_size=224,
+                dropout=0.1,
+                llm_model=model, 
+                llm_tokenizer=tokenizer,
+            )
+    else:
+        goal_model = load_goal_predictor_checkpoint(model_args.model_name_or_path, internvl_model=model, tokenizer=tokenizer)
+
+    trainer = TargetSFTTrainer(
+        model=goal_model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=None,
         tokenizer=tokenizer,
         data_collator=collator,
-        callbacks=[SaveAdaptersCallback()]
+        # callbacks=[SaveAdaptersCallback()]
     )
 
     # Training
@@ -1211,10 +1227,8 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
-        print(f'[Memory Usage before training] {torch.cuda.memory_allocated()/1024/1024/1024:.2f}GB')
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        # trainer.save_model()  # Saves the tokenizer too for easy upload
-        save_adapters_only(model, tokenizer, training_args.output_dir)
+        trainer.save_model()  # Saves the tokenizer too for easy upload
 
         metrics = train_result.metrics
         try:

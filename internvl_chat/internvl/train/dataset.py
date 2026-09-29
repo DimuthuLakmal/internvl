@@ -5,6 +5,10 @@
 # --------------------------------------------------------
 
 import io
+import json
+import logging
+import traceback
+from copy import deepcopy
 
 from transformers.trainer_pt_utils import LabelSmoother
 
@@ -24,8 +28,8 @@ import torchvision.transforms as T
 import transformers
 from decord import VideoReader
 from internvl.conversation import get_conv_template
-from PIL import Image
-from torch.utils.data import ConcatDataset, WeightedRandomSampler
+from PIL import Image, UnidentifiedImageError
+from torch.utils.data import ConcatDataset, Dataset, WeightedRandomSampler
 from torchvision.transforms.functional import InterpolationMode
 
 from .constants import (CLIP_MEAN, CLIP_STD, IMAGENET_MEAN, IMAGENET_STD,
@@ -38,6 +42,8 @@ try:
 except ImportError as E:
     print('petrel_client is not installed. If you read data locally instead of from ceph, ignore it.')
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 def calculate_ngram_repetition(text, n):
@@ -756,10 +762,10 @@ def preprocess_internvl2_5_target(
             batches.append(f'<|im_start|>user\n{conversation["value"]}<|im_end|>\n')
             roles.append('human')
         elif conversation['from'] == 'gpt':
-            batches.append(f'<|im_start|>assistant\n{conversation["value"]}<|im_end|>\n')
+            # batches.append(f'<|im_start|>assistant\n{conversation["value"]}<|im_end|>\n')  # Commenting this for avoid leaking
             str_labels = conversation["value"].strip().split(",")
             raw_labels.append([int(str_labels[0]), int(str_labels[1])])
-            roles.append('gpt')
+            # roles.append('gpt')
         else:
             raise NotImplementedError
 
@@ -971,3 +977,404 @@ def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnai
         thumbnail_img = image.resize((image_size, image_size))
         processed_images.append(thumbnail_img)
     return processed_images
+
+
+class TargetGoalDataset(Dataset):
+    """
+    Dataset for the target/goal-predictor training and inference flows
+    (internvl_chat_pretrain_target.py, eval/traffic/evaluate_goal_predictor.py).
+
+    Conversations are expected to end in a 'gpt' turn holding the ground-truth
+    "x,y" goal coordinates (see preprocess_internvl2_5_target), which are
+    surfaced as raw_labels rather than fed to the model as text.
+    """
+
+    def __init__(
+        self,
+        template_name,
+        meta,
+        tokenizer,
+        tcs_loader,
+        ds_name,
+        num_image_token,
+        image_size=448,
+        is_train=True,
+        pad2square=False,
+        group_by_length=False,
+        dynamic_image_size=False,
+        use_thumbnail=False,
+        min_dynamic_patch=1,
+        max_dynamic_patch=12,
+        min_num_frame=8,  # for video data
+        max_num_frame=32,  # for video data
+        sampling_method='rand',  # for video data
+        repeat_time=1,
+        normalize_type='imagenet',
+        # hyperparameters for packed training
+        use_packed_ds=False,
+        data_rank=0,
+        data_world_size=1,
+        distributed_mode=False,
+        force_shuffle=False,
+        random_seed=0,
+    ):
+        super(TargetGoalDataset, self).__init__()
+        self.ds_name = ds_name
+        self.tokenizer = tokenizer
+        self.template_name = template_name
+        self.num_image_token = num_image_token
+        logger.info(f'[Dataset] num_image_token: {num_image_token}')
+        logger.info(f'[Dataset] dynamic_image_size: {dynamic_image_size}')
+        logger.info(f'[Dataset] use_thumbnail: {use_thumbnail}')
+        logger.info(f'[Dataset] min_dynamic_patch: {min_dynamic_patch}, max_dynamic_patch: {max_dynamic_patch}')
+
+        self.image_size = image_size
+        self.is_train = is_train
+        self.pad2square = pad2square
+        self.max_num_frame = max_num_frame
+        self.min_num_frame = min_num_frame
+        self.sampling_method = sampling_method
+
+        # hyperparameters for distributed training
+        self.use_packed_ds = use_packed_ds
+        self.data_rank = data_rank
+        self.data_world_size = data_world_size
+        self.worker_id = None
+        self.worker_state_key = None
+        self.worker_distributed = False
+        self.distributed_mode = distributed_mode
+        # hyperparameters for packed dataset
+        self.dataset_type = 'pair'
+        self.max_num_images = 1
+        self.max_tokens = tokenizer.model_max_length
+        self.force_shuffle = force_shuffle
+        # TODO: quick resume
+        self._state_dict = {}
+
+        logger.info('Formatting inputs...Skip in lazy mode')
+        assert meta['annotation'].endswith('jsonl'), f'annotation must be jsonl, but got {meta["annotation"]}'
+
+        total_ranks = torch.distributed.get_world_size()
+        self.total_ranks = total_ranks
+        current_rank = torch.distributed.get_rank()
+
+        """
+        This section of the code is used to read hundreds of millions of data entries.
+        By using caching and splitting the data according to rank, it ensures fast reading
+        speed and prevents out-of-memory.
+        """
+        # Create a cache directory path
+        basename = os.path.basename(meta['annotation']).replace('.jsonl', '')
+        data_dir = os.path.join(os.path.dirname(meta['annotation']), f'{basename}_temp')
+        os.makedirs(data_dir, exist_ok=True)  # Create the cache directory if it does not exist
+        # Create a temporary path for the current rank
+        temp_path = os.path.join(data_dir, f'{basename}_{current_rank}_of_{total_ranks}.jsonl')
+
+        # Check if the temporary file for the current rank already exists
+        if os.path.exists(temp_path):
+            # If it exists, read the raw data from the file
+            with open(temp_path, 'r') as f:
+                self.raw_data = f.readlines()
+        else:
+            # If it does not exist, read the raw data from the original annotation file
+            with open(meta['annotation'], 'r') as f:
+                self.raw_data = f.readlines()
+
+            # Adjust the raw data based on the repeat_time parameter
+            if repeat_time < 1:
+                self.raw_data = self.raw_data[:int(len(self.raw_data) * repeat_time)]
+            else:
+                self.raw_data = self.raw_data * int(repeat_time)
+
+            # Calculate the total number of lines and distribute lines to each rank
+            total_lines = len(self.raw_data)
+            logger.info(f'total_ranks: {total_ranks}, current_rank: {current_rank}, total_lines: {total_lines}')
+            lines_per_rank = total_lines // total_ranks  # Number of lines each rank should process
+            lines_per_rank = max(1, lines_per_rank)
+
+            # Calculate the start and end line numbers for the current rank
+            start_line = lines_per_rank * current_rank  # Starting line for the current rank
+            end_line = start_line + lines_per_rank  # Ending line for the current rank
+
+            # Assign the appropriate lines to the current rank
+            self.raw_data = self.raw_data[start_line:end_line]
+
+            # Write the raw data for the current rank to the temporary file
+            with open(temp_path, 'w') as f:
+                f.writelines(self.raw_data)
+
+        self.rng = np.random.default_rng(seed=random_seed)
+        if self.force_shuffle:
+            self.rng.shuffle(self.raw_data)
+
+        self.root = meta['root']
+        self.cached_data_dict = {}
+        self.tcs_loader = tcs_loader
+        self.group_by_length = group_by_length
+        self.dynamic_image_size = dynamic_image_size
+        self.use_thumbnail = use_thumbnail
+        self.min_dynamic_patch = min_dynamic_patch
+        self.max_dynamic_patch = max_dynamic_patch
+        self.normalize_type = normalize_type
+
+        assert not group_by_length
+        # If the precomputed length does not exist, roughly estimate the length of
+        # each sample to improve the efficiency of group_by_length.
+        if self.group_by_length:
+            self.conv2length = {}  # Using a dictionary to speed up token length calculation
+            self.length = []
+            for data_item in self.raw_data:
+                data_item = json.loads(data_item)
+                if 'length' in data_item:
+                    token_length = data_item['length']  # Use precomputed length if available
+                else:
+                    # Compute token length using the tokenizer
+                    conversations = '\n'.join([temp['value'] for temp in data_item['conversations']])
+                    str_length = len(conversations)
+                    if str_length not in self.conv2length:
+                        token_length = tokenizer(
+                            conversations, return_tensors='pt', padding=False, truncation=False,
+                        ).input_ids.size(1)
+                        self.conv2length[str_length] = token_length + num_image_token * (
+                                    max_dynamic_patch + use_thumbnail)
+                    else:
+                        token_length = self.conv2length[str_length]
+                self.length.append(token_length)
+
+    def __len__(self):
+        if not self.use_packed_ds:
+            return len(self.raw_data) * self.total_ranks
+        else:
+            return len(self.raw_data)
+
+    def get_preprocess_function(self):
+        # Select the appropriate preprocessing function based on the template name
+        if self.template_name == 'Hermes-2':
+            preprocess_function = preprocess_mpt
+        elif self.template_name == 'internlm2-chat':
+            preprocess_function = preprocess_internlm
+        elif self.template_name == 'phi3-chat':
+            preprocess_function = preprocess_phi3
+        elif self.template_name == 'internvl2_5':
+            preprocess_function = preprocess_internvl2_5_target
+        else:
+            preprocess_function = preprocess
+        return preprocess_function
+
+    def load_image(self, image_path):
+        # Load the image using tcs_loader if available, otherwise use PIL
+        if self.tcs_loader is not None and 's3://' in image_path:
+            return self.tcs_loader(image_path)
+
+        merged_image = Image.open(image_path).convert('RGB')
+        # Get full merged image size
+        merged_width, merged_height = merged_image.size
+
+        # Since it is a 1 x 4 image
+        single_width = merged_width // 4
+        single_height = merged_height
+
+        # Crop back into 4 original images
+        images_t = []
+
+        for t in range(4):
+            left = t * single_width
+            upper = 0
+            right = (t + 1) * single_width
+            lower = single_height
+
+            image_t = merged_image.crop((left, upper, right, lower))
+            images_t.append(image_t)
+
+        return images_t
+
+    def get_image_path(self, image_path):
+        if image_path.startswith('s3://'):  # for ceph
+            image_path = self.root + image_path
+        else:  # for local image
+            print("Root " + self.root)
+            image_path = os.path.join(self.root, image_path)
+        return image_path
+
+    def get_transform(self):
+        # Build transformation function
+        transform = build_transform(is_train=self.is_train, input_size=self.image_size,
+                                    pad2square=self.pad2square, normalize_type=self.normalize_type)
+        return transform
+
+    def multi_modal_get_item(self, data_item):
+        # Build transformation function
+        transform = self.get_transform()
+
+        # Ensure the first conversation contains an image placeholder
+        if '<image>' not in data_item['conversations'][0]['value']:
+            data_item['conversations'][0]['value'] = '<image>\n' + data_item['conversations'][0]['value']
+
+        # Merge the image path
+        image_path = self.get_image_path(data_item['image'])
+
+        # Load the image using tcs_loader if available, otherwise use PIL
+        image = self.load_image(image_path)
+
+        if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
+            images = dynamic_preprocess(image, min_num=self.min_dynamic_patch, max_num=self.max_dynamic_patch,
+                                        image_size=self.image_size, use_thumbnail=self.use_thumbnail)
+        else:  # Otherwise, use the original image as a single patch
+            images = [image]
+
+        # Apply the transformation to each image and stack the results into a tensor
+        pixel_values = [transform(image) for image in images]
+        pixel_values = torch.stack(pixel_values)
+
+        # Ensure that there is only one patch if dynamic image size is not enabled
+        num_patches = pixel_values.size(0)
+        if not self.dynamic_image_size:
+            assert num_patches == 1, f'The number of patches should be 1, but got {num_patches}.'
+
+        # Select the appropriate preprocessing function based on the template name
+        preprocess_function = self.get_preprocess_function()
+
+        # Preprocess the conversations and generate the return dictionary
+        ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
+                                  self.tokenizer, [self.num_image_token * num_patches],
+                                  group_by_length=self.group_by_length,
+                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name)
+
+        # Calculate position_ids for packed dataset
+        position_ids = ret['attention_mask'].long().cumsum(-1) - 1
+        position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
+        image_end_token_id = self.tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
+        assert (ret['input_ids'][0] == image_end_token_id).sum() == 1, f'image tokens are truncated, this dataset is {self.ds_name}'
+
+        # Create the final return dictionary
+        ret = dict(
+            input_ids=ret['input_ids'][0],
+            labels=None,
+            attention_mask=ret['attention_mask'][0],
+            position_ids=position_ids[0],
+            pixel_values=pixel_values,
+            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
+        )
+        return ret
+
+    def multi_modal_multi_image_get_item(self, data_item):
+        # Build transformation function
+        transform = self.get_transform()
+
+        images, num_tiles = [], []
+        num_image = len(data_item['image'])
+        for i, image_path in enumerate(data_item['image']):
+            # Merge the image path
+            # image_path = self.get_image_path(image_path)
+            image_path = self.root + image_path
+            # Load the image using tcs_loader if available, otherwise use PIL
+            image = self.load_image(image_path)[i]
+            if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
+                image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
+                                           max_num=max(1, self.max_dynamic_patch // num_image),
+                                           image_size=self.image_size, use_thumbnail=self.use_thumbnail)
+                images += image
+                num_tiles.append(len(image))
+            else:  # Otherwise, use the original image as a single patch
+                images.append(image)
+                num_tiles.append(1)
+        pixel_values = [transform(image) for image in images]
+        pixel_values = torch.stack(pixel_values)
+        num_patches = pixel_values.size(0)
+
+        # Select the appropriate preprocessing function based on the template name
+        preprocess_function = self.get_preprocess_function()
+
+        # Preprocess the conversations and generate the return dictionary
+        num_image_tokens = [self.num_image_token * num_tile for num_tile in num_tiles]
+        ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
+                                  self.tokenizer, num_image_tokens, group_by_length=self.group_by_length,
+                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name, num_image=num_image)
+
+        # Calculate position_ids for packed dataset
+        position_ids = ret['attention_mask'].long().cumsum(-1) - 1
+        position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
+        image_end_token_id = self.tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
+        assert (ret['input_ids'][0] == image_end_token_id).sum() == num_image, f'image tokens are truncated, this dataset is {self.ds_name}'
+
+        # Create the final return dictionary
+        ret = dict(
+            input_ids=ret['input_ids'][0],
+            labels=ret['labels'][0],
+            attention_mask=ret['attention_mask'][0],
+            position_ids=position_ids[0],
+            raw_labels=ret['raw_labels'][0],
+            pixel_values=pixel_values,
+            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
+        )
+        return ret
+
+    def _enable_worker_distributed(self):
+        if (
+            self.distributed_mode
+            and not self.worker_distributed
+            and self.worker_id is not None
+        ):
+            self.worker_distributed = True
+            num_worker_per_rank = self.num_workers // self.total_ranks
+            self.raw_data = self.raw_data[self.worker_id % num_worker_per_rank::num_worker_per_rank]
+            logger.info(f'worker_distributed is enabled, {self.num_workers=}, {len(self.raw_data)=}')
+
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        if i >= len(self.raw_data):
+            if self.use_packed_ds:
+                raise NotImplementedError
+            else:
+                i = i % len(self.raw_data)
+
+        try_cnt, max_try = 0, 10
+        while True:
+            if try_cnt > max_try:
+                raise StopIteration
+            try:
+                data_item = json.loads(self.raw_data[i])
+                # conversations = data_item['conversations']
+                # check_conversations_repetition(conversations, repeat_threshold=0.4, ngram=10)
+                if 'image' in data_item and len(data_item['image']) != 0:
+                    if type(data_item['image']) == list:
+                        ret = self.multi_modal_multi_image_get_item(data_item)
+                    else:
+                        ret = self.multi_modal_get_item(data_item)
+                break
+            except Exception as e:
+                try_cnt += 1
+                print(e, self.ds_name, flush=True)
+                if not isinstance(e, (UnidentifiedImageError, FileNotFoundError)):
+                    traceback.print_exc()
+                data_item = json.loads(self.raw_data[i])
+                if 'image' in data_item:
+                    if type(data_item['image']) == list:
+                        images = [self.root + item for item in data_item['image']]
+                        print(f'Failed to load image: {images}, the dataset is: {self.ds_name}')
+                    else:
+                        if data_item['image'].startswith('s3://'):
+                            data_path = self.root + data_item['image']
+                        else:
+                            data_path = os.path.join(self.root, data_item['image'])
+                        print(f'Failed to load image: {data_path}, the dataset is: {self.ds_name}')
+                i = random.randint(0, len(self.raw_data) - 1)
+        return ret
+
+    def __iter__(self):
+        self._enable_worker_distributed()
+        start_idx = 0
+
+        assert self.worker_state_key is not None
+        if self.worker_state_key in self._state_dict and len(self._state_dict[self.worker_state_key]) > 0:
+            start_idx = self._state_dict[self.worker_state_key]['current_idx']
+
+            self._state_dict.pop(self.worker_state_key)
+
+        if self.worker_id == 0:
+            logger.info(
+                f'[{self.ds_name}] [Worker id {self.worker_id}] '
+                f'begin to iter with {start_idx=}'
+            )
+
+        for i in range(start_idx, len(self)):
+            yield self[i]

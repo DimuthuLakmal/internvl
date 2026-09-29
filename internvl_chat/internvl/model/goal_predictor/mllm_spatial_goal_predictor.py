@@ -335,6 +335,15 @@ class MLLMGoalPredictor(nn.Module):
     ):
         super().__init__()
 
+        self.init_config = {
+            "mllm_hidden_dim": mllm_hidden_dim,
+            "feat_dim": feat_dim,
+            "attn_dim": attn_dim,
+            "num_sections": num_sections,
+            "map_size": map_size,
+            "dropout": dropout,
+        }
+
         self.map_size = map_size
 
         self.llm_model = llm_model
@@ -431,6 +440,7 @@ class MLLMGoalPredictor(nn.Module):
             use_cache=False)
 
         hidden_states = outputs.hidden_states[-1]  # [B, 8192, H]
+        hidden_states = hidden_states.to(self.sequence_encoder.input_proj.weight.dtype)
         attention_mask = inputs.get("attention_mask", None)
 
         feat = self.sequence_encoder(

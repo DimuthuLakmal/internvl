@@ -26,7 +26,7 @@ except:
 import torch
 import torch.distributed as dist
 import transformers
-from internvl.dist_utils import init_dist
+from internvl.utils.dist_utils import init_dist
 from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
 from internvl.model.internvl_chat import (InternVisionConfig,
                                           InternVisionModel,
@@ -334,54 +334,15 @@ class LazySupervisedDataset(Dataset):
         logger.info('Formatting inputs...Skip in lazy mode')
         assert meta['annotation'].endswith('jsonl'), f'annotation must be jsonl, but got {meta["annotation"]}'
 
-        total_ranks = torch.distributed.get_world_size()
-        self.total_ranks = total_ranks
-        current_rank = torch.distributed.get_rank()
-
-        """
-        This section of the code is used to read hundreds of millions of data entries.
-        By using caching and splitting the data according to rank, it ensures fast reading
-        speed and prevents out-of-memory.
-        """
-        # Create a cache directory path
-        basename = os.path.basename(meta['annotation']).replace('.jsonl', '')
-        data_dir = os.path.join(os.path.dirname(meta['annotation']), f'{basename}_temp')
-        os.makedirs(data_dir, exist_ok=True)  # Create the cache directory if it does not exist
-        # Create a temporary path for the current rank
-        temp_path = os.path.join(data_dir, f'{basename}_{current_rank}_of_{total_ranks}.jsonl')
-
-        # Check if the temporary file for the current rank already exists
-        if os.path.exists(temp_path):
-            # If it exists, read the raw data from the file
-            with open(temp_path, 'r') as f:
-                self.raw_data = f.readlines()
-        else:
-            # If it does not exist, read the raw data from the original annotation file
-            with open(meta['annotation'], 'r') as f:
-                self.raw_data = f.readlines()
-
-            # Adjust the raw data based on the repeat_time parameter
+        with open(meta['annotation'], 'r') as f:
+            self.raw_data = f.readlines()
             if repeat_time < 1:
+                # If repeat_time is less than 1, select a portion of the data
                 self.raw_data = self.raw_data[:int(len(self.raw_data) * repeat_time)]
-            else:
-                self.raw_data = self.raw_data * int(repeat_time)
-
-            # Calculate the total number of lines and distribute lines to each rank
-            total_lines = len(self.raw_data)
-            logger.info(f'total_ranks: {total_ranks}, current_rank: {current_rank}, total_lines: {total_lines}')
-            lines_per_rank = total_lines // total_ranks  # Number of lines each rank should process
-            lines_per_rank = max(1, lines_per_rank)
-
-            # Calculate the start and end line numbers for the current rank
-            start_line = lines_per_rank * current_rank  # Starting line for the current rank
-            end_line = start_line + lines_per_rank  # Ending line for the current rank
-
-            # Assign the appropriate lines to the current rank
-            self.raw_data = self.raw_data[start_line:end_line]
-
-            # Write the raw data for the current rank to the temporary file
-            with open(temp_path, 'w') as f:
-                f.writelines(self.raw_data)
+            if repeat_time > 1:
+                assert isinstance(repeat_time, int)
+                # Repeat the list if repeat_time is greater than 1
+                self.raw_data = self.raw_data * repeat_time
 
         self.rng = np.random.default_rng(seed=random_seed)
         if self.force_shuffle:
@@ -397,7 +358,6 @@ class LazySupervisedDataset(Dataset):
         self.max_dynamic_patch = max_dynamic_patch
         self.normalize_type = normalize_type
 
-        assert not group_by_length
         # If the precomputed length does not exist, roughly estimate the length of
         # each sample to improve the efficiency of group_by_length.
         if self.group_by_length:
@@ -422,10 +382,7 @@ class LazySupervisedDataset(Dataset):
                 self.length.append(token_length)
 
     def __len__(self):
-        if not self.use_packed_ds:
-            return len(self.raw_data) * self.total_ranks
-        else:
-            return len(self.raw_data)
+        return len(self.raw_data)
 
     def get_preprocess_function(self):
         # Select the appropriate preprocessing function based on the template name
@@ -451,7 +408,6 @@ class LazySupervisedDataset(Dataset):
         if image_path.startswith('s3://'):  # for ceph
             image_path = self.root + image_path
         else:  # for local image
-            print("Root " + self.root)
             image_path = os.path.join(self.root, image_path)
         return image_path
 
@@ -673,8 +629,7 @@ class LazySupervisedDataset(Dataset):
             and self.worker_id is not None
         ):
             self.worker_distributed = True
-            num_worker_per_rank = self.num_workers // self.total_ranks
-            self.raw_data = self.raw_data[self.worker_id % num_worker_per_rank::num_worker_per_rank]
+            self.raw_data = self.raw_data[self.worker_id::self.num_workers]
             logger.info(f'worker_distributed is enabled, {self.num_workers=}, {len(self.raw_data)=}')
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:

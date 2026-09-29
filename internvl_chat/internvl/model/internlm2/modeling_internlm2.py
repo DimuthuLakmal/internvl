@@ -962,6 +962,7 @@ class InternLM2Model(InternLM2PreTrainedModel):
                     attention_mask,
                     position_ids,
                     None,
+                    use_reentrant=False,
                 )
             else:
                 layer_outputs = decoder_layer(
