@@ -371,12 +371,53 @@ class MLLMGoalPredictor(nn.Module):
             feat_dim=feat_dim,
         )
 
+        # x (forward progress) is mostly set by ego speed, which the LLM can't read reliably
+        # from the coordinate text, so the x head also gets the numeric ego history
+        self.x_hist_encoder = nn.Sequential(
+            nn.Linear(40, 64),
+            nn.GELU(),
+            nn.Linear(64, 64),
+        )
+
         self.goal_head = nn.Sequential(
-            nn.Linear(256, 256),
+            nn.Linear(256 + 64, 256),
             nn.LayerNorm(256),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 2),
+            nn.Linear(256, 1),
+        )
+
+        # Linear kinematic prior (e.g. constant-velocity extrapolation); goal_head learns the residual.
+        # Zero-init so training starts from the plain head.
+        self.x_prior = nn.Linear(40, 1)
+        nn.init.zeros_(self.x_prior.weight)
+        nn.init.zeros_(self.x_prior.bias)
+
+        # y has no signal in the coordinate text, so it gets its own encoder over image tokens only
+        self.y_sequence_encoder = LatentTransformerEncoder(
+            input_dim=mllm_hidden_dim,
+            latent_dim=256,
+            num_latents=64,
+            num_heads=8,
+            num_layers=2,
+            ff_dim=512,
+            dropout=dropout,
+            feat_dim=feat_dim,
+        )
+
+        # The ego's lateral drift (a few px) carries the sign of y but is too fine for image tokens
+        self.hist_encoder = nn.Sequential(
+            nn.Linear(40, 64),
+            nn.GELU(),
+            nn.Linear(64, 64),
+        )
+
+        self.y_head = nn.Sequential(
+            nn.Linear(256 + 64, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 1),
         )
 
         # self.raster_decoder = MLLMRasterGoalDecoder(
@@ -432,6 +473,7 @@ class MLLMGoalPredictor(nn.Module):
         """
 
         # all_hidden_states = generate_llm_output(obs_dict['llm_text'], obs_dict['llm_images'], self.llm_config, self.llm_model, self.llm_tokenizer)
+        ego_hist = inputs.pop("ego_hist")  # [B, 40], consumed by the y branch, not the LLM
         inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
         outputs = self.llm_model(
             **inputs,
@@ -448,6 +490,18 @@ class MLLMGoalPredictor(nn.Module):
             valid_token_mask=attention_mask,
         )
 
-        pred_xy_norm = self.goal_head(feat)
-        
+        ego_hist = ego_hist.to(feat.dtype)
+        x_hist = self.x_hist_encoder(ego_hist)
+        x_pred = self.goal_head(torch.cat([feat, x_hist], dim=-1)) + self.x_prior(ego_hist)
+
+        # y reads road geometry from the map image tokens only (keeps x's text shortcut out),
+        # plus the ego's numeric history for the direction of lateral drift
+        image_mask = inputs["input_ids"] == self.llm_model.img_context_token_id
+        if attention_mask is not None:
+            image_mask = image_mask & attention_mask.bool()
+        y_feat = self.y_sequence_encoder(hidden_states, valid_token_mask=image_mask)
+        hist_feat = self.hist_encoder(ego_hist.to(y_feat.dtype))
+        y_pred = self.y_head(torch.cat([y_feat, hist_feat], dim=-1))
+        pred_xy_norm = torch.cat([x_pred, y_pred], dim=-1)
+
         return pred_xy_norm

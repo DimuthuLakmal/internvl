@@ -979,6 +979,27 @@ def dynamic_preprocess(image, min_num=1, max_num=6, image_size=448, use_thumbnai
     return processed_images
 
 
+def extract_ego_history(conversations, anchor=(56.0, 112.0), scale=(56.0, 8.0)):
+    """
+    Parse the ego row after 'Coordinates:' into a [40] float tensor of (x, y) offsets
+    from the ego's current position, scaled so a few-px lateral drift is O(1).
+    (0,0) entries are noise and are back-filled from the next valid point.
+    """
+    human = next(c['value'] for c in conversations if c['from'] == 'human')
+    row = human.split('Coordinates:\n')[1].split('|')[0].split(',')
+    pts = [(float(row[i]), float(row[i + 1])) for i in range(0, 40, 2)]
+
+    last_valid = anchor
+    for i in reversed(range(len(pts))):
+        if pts[i] == (0.0, 0.0):
+            pts[i] = last_valid
+        else:
+            last_valid = pts[i]
+
+    ego_hist = (torch.tensor(pts) - torch.tensor(anchor)) / torch.tensor(scale)
+    return ego_hist.clamp(-5.0, 5.0).flatten()  # [40]
+
+
 class TargetGoalDataset(Dataset):
     """
     Dataset for the target/goal-predictor training and inference flows
@@ -1304,6 +1325,7 @@ class TargetGoalDataset(Dataset):
             attention_mask=ret['attention_mask'][0],
             position_ids=position_ids[0],
             raw_labels=ret['raw_labels'][0],
+            ego_hist=extract_ego_history(data_item['conversations']),
             pixel_values=pixel_values,
             image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
         )

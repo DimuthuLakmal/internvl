@@ -69,7 +69,8 @@ def concat_pad_data_collator(features, max_item_length=None, pad_id=0):
         temp_labels = torch.LongTensor([IGNORE_INDEX] * max_item_length)
         temp_labels[:feat['labels'].shape[0]] = feat['labels']
         feat['labels'] = temp_labels
-        feat['attention_mask'] = feat['input_ids'].ne(pad_id)
+        # feat['attention_mask'] = feat['input_ids'].ne(pad_id) # commented this because we already mask using the pad_id. We don't pass the correct pad_id token used by the model here. 
+        feat['attention_mask'] = feat['attention_mask']
 
         if 'position_ids' in feat:
             temp_position_ids = torch.LongTensor([pad_id] * max_item_length)

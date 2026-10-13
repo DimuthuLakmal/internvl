@@ -30,7 +30,7 @@ from internvl.utils.mlflow_utils import (setup_mlflow_env, MLflowConfigCallback,
 from internvl.train.target_trainer import TargetSFTTrainer
 from internvl.patch import (concat_pad_data_collator,
                             replace_internlm2_attention_class,
-                            replace_llama_attention_class,
+                            replace_llama_attention_class, # for now since we don't use packed_ds, we don't need this
                             replace_llama_rmsnorm_with_fused_rmsnorm,
                             replace_phi3_attention_class,
                             replace_qwen2_attention_class,
@@ -293,6 +293,7 @@ def main():
             micro_num=training_args.train_batch_size,
             len2weight=partial(len2weight, loss_reduction=data_args.loss_reduction),
             loss_reduction_all_gather=data_args.loss_reduction_all_gather,
+            pad_id=tokenizer.pad_token_id,
         )
     else:
         collator = concat_pad_data_collator

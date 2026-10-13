@@ -23,6 +23,9 @@ class TargetSFTTrainer(Trainer):
     INTERNVL_ATTRIBUTE = "llm_model"
     INTERNVL_STATE_PREFIX = "llm_model."
 
+    # Pixel-space target std (x, y) measured on train_internvl_target_pred_filtered_y.jsonl
+    COORD_STD_PX = (40.0, 17.2)
+
     def __init__(
         self,
         **kwargs
@@ -405,26 +408,39 @@ class TargetSFTTrainer(Trainer):
             reduction="none",
         )  # [B, 2]
 
-        loss_x = loss_per_coord[:, 0].mean()
-        loss_y = loss_per_coord[:, 1].mean()
-
         y_sample_weights = self.compute_y_sample_weights(
             target_y=target_xy[:, 1],
             center_y=112.0,
             base_weight=1.0,
             scale=0.2,
-            max_weight=6.0,
-        )
+            max_weight=5.0,
+        )  # [B]
 
-        # loss_norm = loss_x + y_sample_weights * loss_y
+        # Same tail weighting for x around the ego's x anchor, so far/fast goals aren't averaged away
+        x_sample_weights = self.compute_y_sample_weights(
+            target_y=target_xy[:, 0],
+            center_y=56.0,
+            base_weight=1.0,
+            scale=0.1,
+            max_weight=20.0,
+        )  # [B]
+
+        # Scale y so errors measured in each coordinate's std weigh equally (x unchanged).
+        # Normalized-space errors are < 1 (quadratic smooth-L1) -> squared ratio;
+        # pixel-space errors are > 1 (linear smooth-L1) -> plain ratio.
+        y_scale = self.COORD_STD_PX[0] / self.COORD_STD_PX[1]
+
+        # Weight each sample's y-loss before averaging so tail targets keep their influence
+        loss_x = (x_sample_weights * loss_per_coord[:, 0]).mean()
+        loss_y = y_scale ** 2 * (y_sample_weights * loss_per_coord[:, 1]).mean()
+
         loss_norm = loss_x + loss_y
 
         pred_xy_px = (outputs + 1.0) * 0.5 * (224 - 1)
         loss_px = F.smooth_l1_loss(pred_xy_px, target_xy, reduction="none")
-        loss_x_px = loss_px[:, 0].mean()
-        loss_y_px = loss_px[:, 1].mean()
+        loss_x_px = (x_sample_weights * loss_px[:, 0]).mean()
+        loss_y_px = y_scale * (y_sample_weights * loss_px[:, 1]).mean()
 
-        # loss_px = loss_x_px + y_sample_weights * loss_y_px
         loss_px = loss_x_px + loss_y_px
 
         loss = loss_norm + 0.01 * loss_px
@@ -456,7 +472,7 @@ class TargetSFTTrainer(Trainer):
                     "--------------------------------------------------\n"
                 )
 
-            with open("training_log.txt", "a") as f:
+            with open("training_log_kd.txt", "a") as f:
                 f.write(log_msg)
                 f.flush()
 
