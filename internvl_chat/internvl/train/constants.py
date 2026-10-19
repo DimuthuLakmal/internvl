@@ -13,6 +13,8 @@ REF_START_TOKEN = '<ref>'
 REF_END_TOKEN = '</ref>'
 BOX_START_TOKEN = '<box>'
 BOX_END_TOKEN = '</box>'
+# Placeholder for the goal predictor's learnable query embeddings (overwritten before the LLM)
+GOAL_TOKEN = '<GOAL>'
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 CLIP_MEAN = (0.4814546, 0.4578275, 0.40821073)

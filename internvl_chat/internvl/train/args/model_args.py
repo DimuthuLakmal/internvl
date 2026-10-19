@@ -63,6 +63,21 @@ class ModelArguments:
         default=0.0,
         metadata={'help': 'Set the drop path rate for the ViT. Default is 0.'},
     )
+    vision_lr: Optional[float] = field(
+        default=None,
+        metadata={'help': 'Learning rate for the ViT (vision_model). Default is None, which uses --learning_rate. '
+                          'Requires a DeepSpeed config without an "optimizer" section.'},
+    )
+    vit_layer_decay: float = field(
+        default=1.0,
+        metadata={'help': 'Layer-wise LR decay for the ViT: layer i of N gets vision_lr * decay ** (N - i). '
+                          'Default is 1.0 (no decay).'},
+    )
+    ema_decay: float = field(
+        default=0.999,
+        metadata={'help': 'Decay of the EMA copy of trainable weights, updated once per optimizer step and saved as '
+                          'ema_trainable.pt in each checkpoint. Set to 0 to disable. Default is 0.999.'},
+    )
     ps_version: Literal['v1', 'v2'] = field(
         default='v2',
         metadata={'help': 'Specify the version of pixel shuffle implementation. Default is v2.'}

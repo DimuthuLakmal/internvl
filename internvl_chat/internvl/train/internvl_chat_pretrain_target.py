@@ -17,8 +17,10 @@ import torch
 import torch.distributed as dist
 import transformers
 from internvl.utils.dist_utils import init_dist
-from internvl.model.goal_predictor.mllm_spatial_goal_predictor import MLLMGoalPredictor
-from internvl.model.goal_predictor.checkpoint_io import load_goal_predictor_checkpoint
+from internvl.model.goal_predictor.mllm_spatial_goal_predictor import (MLLMGoalPredictor,
+                                                                       MLLMHeatmapGoalPredictor)
+from internvl.model.goal_predictor.checkpoint_io import (load_goal_predictor_checkpoint,
+                                                         read_predictor_config)
 from internvl.model.goal_predictor.model_utils import (freeze_model_components,
                                                         load_and_configure_llm_model)
 from internvl.train.args import (ModelArguments, DataTrainingArguments,
@@ -36,7 +38,7 @@ from internvl.patch import (concat_pad_data_collator,
                             replace_qwen2_attention_class,
                             replace_train_dataloader, replace_train_sampler)
 from internvl.train.constants import (BOX_END_TOKEN, BOX_START_TOKEN,
-                                      IMG_CONTEXT_TOKEN, IMG_END_TOKEN,
+                                      GOAL_TOKEN, IMG_CONTEXT_TOKEN, IMG_END_TOKEN,
                                       IMG_START_TOKEN, QUAD_END_TOKEN,
                                       QUAD_START_TOKEN, REF_END_TOKEN,
                                       REF_START_TOKEN)
@@ -88,6 +90,7 @@ def build_datasets(
     min_num_frame=8,
     max_num_frame=32,
     normalize_type='imagenet',
+    num_goal_queries=0,
 ):
     datasets = []
     lengths = []
@@ -126,6 +129,7 @@ def build_datasets(
             distributed_mode=data_args.use_packed_ds,
             force_shuffle=data_args.use_packed_ds,
             random_seed=ds_idx,
+            num_goal_queries=num_goal_queries,
         )
         logger.info(f'Add dataset: {ds_name} with length: {len(dataset)}')
         datasets.append(dataset)
@@ -253,7 +257,7 @@ def main():
     tokenizer.model_max_length = data_args.max_seq_length
     token_list = [IMG_START_TOKEN, IMG_END_TOKEN, IMG_CONTEXT_TOKEN,
                   QUAD_START_TOKEN, QUAD_END_TOKEN, REF_START_TOKEN,
-                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN]
+                  REF_END_TOKEN, BOX_START_TOKEN, BOX_END_TOKEN, GOAL_TOKEN]
     num_new_tokens = tokenizer.add_tokens(token_list, special_tokens=True)
     img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     tcs_loader = TCSLoader('~/petreloss.conf') if has_tcs_loader else None
@@ -273,12 +277,22 @@ def main():
     llm_model = load_and_configure_llm_model(
         model_args, data_args, tokenizer, num_new_tokens, img_context_token_id, logger)
 
+    # The prompt must carry as many <GOAL> placeholders as the predictor has query embeddings
+    if model_args.load_checkpoint:
+        _, predictor_config = read_predictor_config(model_args.model_name_or_path)
+        num_goal_queries = predictor_config.get('num_goal_queries', 0)
+    elif goal_predictor_args.goal_predictor_type == 'heatmap':
+        num_goal_queries = goal_predictor_args.num_goal_queries
+    else:
+        num_goal_queries = 0
+    logger.info(f'num_goal_queries: {num_goal_queries}')
+
     train_dataset = build_datasets(
         data_args, tokenizer, tcs_loader, llm_model, group_by_length=training_args.group_by_length,
         dynamic_image_size=data_args.dynamic_image_size, use_thumbnail=data_args.use_thumbnail,
         min_dynamic_patch=data_args.min_dynamic_patch, max_dynamic_patch=data_args.max_dynamic_patch,
         normalize_type=data_args.normalize_type, min_num_frame=data_args.min_num_frame,
-        max_num_frame=data_args.max_num_frame)
+        max_num_frame=data_args.max_num_frame, num_goal_queries=num_goal_queries)
 
     freeze_model_components(llm_model, model_args, logger)
 
@@ -301,15 +315,33 @@ def main():
     # Initialing SpatialPlanner
     if not model_args.load_checkpoint:
         mllm_hidden_dim = goal_predictor_args.mllm_hidden_dim or llm_model.config.llm_config.hidden_size
-        model = MLLMGoalPredictor(
+        if goal_predictor_args.goal_predictor_type == 'heatmap':
+            model = MLLMHeatmapGoalPredictor(
+                mllm_hidden_dim=mllm_hidden_dim,
+                num_goal_queries=goal_predictor_args.num_goal_queries,
+                llm_tap_layers=[int(i) for i in goal_predictor_args.llm_tap_layers.split(',')],
+                heatmap_size=goal_predictor_args.heatmap_size,
+                heatmap_sigma=goal_predictor_args.heatmap_sigma,
+                offset_loss_weight=goal_predictor_args.offset_loss_weight,
+                hist_dropout=goal_predictor_args.hist_dropout,
+                dropout=goal_predictor_args.dropout,
+                ablate_mllm=goal_predictor_args.ablate_mllm,
+                llm_model=llm_model,
+                llm_tokenizer=tokenizer,
+            )
+        elif goal_predictor_args.goal_predictor_type == 'regression':
+            model = MLLMGoalPredictor(
                 mllm_hidden_dim=mllm_hidden_dim,
                 attn_dim=goal_predictor_args.attn_dim,
                 num_sections=goal_predictor_args.num_sections,
                 map_size=goal_predictor_args.map_size,
                 dropout=goal_predictor_args.dropout,
+                ablate_mllm=goal_predictor_args.ablate_mllm,
                 llm_model=llm_model,
                 llm_tokenizer=tokenizer,
             )
+        else:
+            raise ValueError(f'Unknown goal_predictor_type: {goal_predictor_args.goal_predictor_type}')
     else:
         model = load_goal_predictor_checkpoint(model_args.model_name_or_path, internvl_model=llm_model, tokenizer=tokenizer)
 
@@ -320,6 +352,9 @@ def main():
         eval_dataset=None,
         tokenizer=tokenizer,
         data_collator=collator,
+        vision_lr=model_args.vision_lr,
+        vit_layer_decay=model_args.vit_layer_decay,
+        ema_decay=model_args.ema_decay,
     )
 
     if 'mlflow' in training_args.report_to:

@@ -43,7 +43,7 @@ def load_and_configure_llm_model(model_args, data_args, tokenizer, num_new_token
     config.max_dynamic_patch = data_args.max_dynamic_patch
 
     if model_args.load_checkpoint:
-        llm_model = load_llm_checkpoint(model_args.model_name_or_path, load_tokenizer=False)
+        llm_model = load_llm_checkpoint(model_args.model_name_or_path, load_tokenizer=False, config=config)
     else:
         llm_model = InternVLChatModel.from_pretrained(
             model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config,
@@ -92,7 +92,10 @@ def load_and_configure_llm_model(model_args, data_args, tokenizer, num_new_token
     llm_model.config.force_image_size = data_args.force_image_size
     llm_model.num_image_token = int((data_args.force_image_size // patch_size) ** 2 * (data_args.down_sample_ratio ** 2))
 
-    if num_new_tokens > 0:
+    # The embedding matrix may already be padded past len(tokenizer); only grow it, never shrink
+    num_embeddings = llm_model.language_model.get_input_embeddings().weight.shape[0]
+    if num_new_tokens > 0 and len(tokenizer) > num_embeddings:
+        num_new_tokens = len(tokenizer) - num_embeddings
         llm_model.language_model.resize_token_embeddings(len(tokenizer))
         output_embeddings = llm_model.language_model.get_output_embeddings().weight.data
         output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
@@ -128,7 +131,8 @@ def freeze_model_components(llm_model, model_args, logger):
         _freeze_params(llm_model.language_model)
 
     if model_args.unfreeze_lm_head:
-        llm_model.language_model.lm_head.requires_grad = True
+        for param in llm_model.language_model.lm_head.parameters():
+            param.requires_grad = True
 
     if model_args.use_backbone_lora:
         llm_model.wrap_backbone_lora(r=model_args.use_backbone_lora, lora_alpha=2 * model_args.use_backbone_lora)

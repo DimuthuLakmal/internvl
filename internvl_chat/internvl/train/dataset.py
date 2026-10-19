@@ -32,7 +32,7 @@ from PIL import Image, UnidentifiedImageError
 from torch.utils.data import ConcatDataset, Dataset, WeightedRandomSampler
 from torchvision.transforms.functional import InterpolationMode
 
-from .constants import (CLIP_MEAN, CLIP_STD, IMAGENET_MEAN, IMAGENET_STD,
+from .constants import (CLIP_MEAN, CLIP_STD, GOAL_TOKEN, IMAGENET_MEAN, IMAGENET_STD,
                         IMG_CONTEXT_TOKEN, IMG_END_TOKEN, IMG_START_TOKEN,
                         SIGLIP_MEAN, SIGLIP_STD)
 
@@ -723,7 +723,8 @@ def preprocess_internvl2_5_target(
         group_by_length: bool = False,
         use_packed_ds: bool = False,
         ds_name: str = None,
-        num_image: int = 1
+        num_image: int = 1,
+        num_goal_queries: int = 0
 ) -> Dict:
     assert len(sources) == 1, 'process only the first conversations'
     conversations = sources[0]
@@ -769,6 +770,11 @@ def preprocess_internvl2_5_target(
         else:
             raise NotImplementedError
 
+    if num_goal_queries > 0:
+        # Placeholders where the answer would start; the goal predictor overwrites their embeddings
+        batches.append(f'<|im_start|>assistant\n{GOAL_TOKEN * num_goal_queries}')
+        roles.append('goal_query')
+
     add_bos_token = getattr(tokenizer, 'add_bos_token', False)
     if add_bos_token:  # for InternLM series
         batches[0] = tokenizer.bos_token + batches[0]
@@ -789,7 +795,7 @@ def preprocess_internvl2_5_target(
     ignore_ids = tokenizer('<|im_start|>assistant\n', return_tensors='np').input_ids[0]
     ignore_len = ignore_ids.shape[0] - 1 if add_bos_token else ignore_ids.shape[0]
     for role, input_id in zip(roles, input_ids):
-        if role == 'system' or role == 'human':
+        if role == 'system' or role == 'human' or role == 'goal_query':
             final_targets.append(np.full(input_id.shape, IGNORE_TOKEN_ID))  # ignore
             final_input_ids.append(input_id)
         elif role == 'gpt':
@@ -800,8 +806,16 @@ def preprocess_internvl2_5_target(
             final_input_ids.append(np.full(input_id.shape, tokenizer.pad_token_id))
         # else:
         #     raise NotImplementedError
-    input_ids = torch.tensor(np.concatenate(final_input_ids))[:tokenizer.model_max_length]
-    targets = torch.tensor(np.concatenate(final_targets))[:tokenizer.model_max_length]
+    if num_goal_queries > 0:
+        # Over-long prompts are cut from the end, which would drop the trailing <GOAL> segment;
+        # cut the body (the last coordinate rows) instead so the query tokens always survive
+        goal_ids, goal_targets = final_input_ids.pop(), final_targets.pop()
+        body_len = tokenizer.model_max_length - goal_ids.shape[0]
+        input_ids = torch.tensor(np.concatenate([np.concatenate(final_input_ids)[:body_len], goal_ids]))
+        targets = torch.tensor(np.concatenate([np.concatenate(final_targets)[:body_len], goal_targets]))
+    else:
+        input_ids = torch.tensor(np.concatenate(final_input_ids))[:tokenizer.model_max_length]
+        targets = torch.tensor(np.concatenate(final_targets))[:tokenizer.model_max_length]
 
     padding = False if group_by_length or use_packed_ds else True
     if padding:
@@ -1038,11 +1052,16 @@ class TargetGoalDataset(Dataset):
         distributed_mode=False,
         force_shuffle=False,
         random_seed=0,
+        num_goal_queries=0,
     ):
         super(TargetGoalDataset, self).__init__()
         self.ds_name = ds_name
         self.tokenizer = tokenizer
         self.template_name = template_name
+        if num_goal_queries > 0 and template_name != 'internvl2_5':
+            raise ValueError(f'num_goal_queries is only supported for the internvl2_5 template, got {template_name}')
+        # Only passed when set: the other templates' preprocess functions don't take it
+        self.goal_query_kwargs = {'num_goal_queries': num_goal_queries} if num_goal_queries > 0 else {}
         self.num_image_token = num_image_token
         logger.info(f'[Dataset] num_image_token: {num_image_token}')
         logger.info(f'[Dataset] dynamic_image_size: {dynamic_image_size}')
@@ -1259,7 +1278,8 @@ class TargetGoalDataset(Dataset):
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
                                   self.tokenizer, [self.num_image_token * num_patches],
                                   group_by_length=self.group_by_length,
-                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name)
+                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name,
+                                  **self.goal_query_kwargs)
 
         # Calculate position_ids for packed dataset
         position_ids = ret['attention_mask'].long().cumsum(-1) - 1
@@ -1310,7 +1330,8 @@ class TargetGoalDataset(Dataset):
         num_image_tokens = [self.num_image_token * num_tile for num_tile in num_tiles]
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
                                   self.tokenizer, num_image_tokens, group_by_length=self.group_by_length,
-                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name, num_image=num_image)
+                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name, num_image=num_image,
+                                  **self.goal_query_kwargs)
 
         # Calculate position_ids for packed dataset
         position_ids = ret['attention_mask'].long().cumsum(-1) - 1
