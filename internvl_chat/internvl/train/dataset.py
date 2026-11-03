@@ -1014,6 +1014,86 @@ def extract_ego_history(conversations, anchor=(56.0, 112.0), scale=(56.0, 8.0)):
     return ego_hist.clamp(-5.0, 5.0).flatten()  # [40]
 
 
+def get_target_preprocess_function(template_name):
+    # Select the appropriate preprocessing function based on the template name
+    if template_name == 'Hermes-2':
+        return preprocess_mpt
+    elif template_name == 'internlm2-chat':
+        return preprocess_internlm
+    elif template_name == 'phi3-chat':
+        return preprocess_phi3
+    elif template_name == 'internvl2_5':
+        return preprocess_internvl2_5_target
+    return preprocess
+
+
+def build_target_multi_image_sample(
+        conversations,
+        frames,
+        *,
+        tokenizer,
+        transform,
+        template_name,
+        num_image_token,
+        dynamic_image_size,
+        min_dynamic_patch,
+        max_dynamic_patch,
+        use_thumbnail,
+        image_size,
+        group_by_length,
+        use_packed_ds,
+        ds_name,
+        num_goal_queries=0,
+):
+    """
+    Turn one multi-image sample (conversations + already-loaded PIL frames) into model inputs.
+
+    Shared by TargetGoalDataset (training) and internvl.inference (serving) so both build
+    identical tensors. Conversations without a 'gpt' turn (serving) yield raw_labels=None.
+    """
+    images, num_tiles = [], []
+    num_image = len(frames)
+    for image in frames:
+        if dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
+            tiles = dynamic_preprocess(image, min_num=min_dynamic_patch,
+                                       max_num=max(1, max_dynamic_patch // num_image),
+                                       image_size=image_size, use_thumbnail=use_thumbnail)
+            images += tiles
+            num_tiles.append(len(tiles))
+        else:  # Otherwise, use the original image as a single patch
+            images.append(image)
+            num_tiles.append(1)
+    pixel_values = [transform(image) for image in images]
+    pixel_values = torch.stack(pixel_values)
+    num_patches = pixel_values.size(0)
+
+    # Preprocess the conversations and generate the return dictionary
+    preprocess_function = get_target_preprocess_function(template_name)
+    goal_query_kwargs = {'num_goal_queries': num_goal_queries} if num_goal_queries > 0 else {}
+    num_image_tokens = [num_image_token * num_tile for num_tile in num_tiles]
+    ret = preprocess_function(template_name, [deepcopy(conversations)],
+                              tokenizer, num_image_tokens, group_by_length=group_by_length,
+                              use_packed_ds=use_packed_ds, ds_name=ds_name, num_image=num_image,
+                              **goal_query_kwargs)
+
+    # Calculate position_ids for packed dataset
+    position_ids = ret['attention_mask'].long().cumsum(-1) - 1
+    position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
+    image_end_token_id = tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
+    assert (ret['input_ids'][0] == image_end_token_id).sum() == num_image, f'image tokens are truncated, this dataset is {ds_name}'
+
+    return dict(
+        input_ids=ret['input_ids'][0],
+        labels=ret['labels'][0],
+        attention_mask=ret['attention_mask'][0],
+        position_ids=position_ids[0],
+        raw_labels=ret['raw_labels'][0] if ret['raw_labels'] else None,
+        ego_hist=extract_ego_history(conversations),
+        pixel_values=pixel_values,
+        image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
+    )
+
+
 class TargetGoalDataset(Dataset):
     """
     Dataset for the target/goal-predictor training and inference flows
@@ -1188,18 +1268,7 @@ class TargetGoalDataset(Dataset):
             return len(self.raw_data)
 
     def get_preprocess_function(self):
-        # Select the appropriate preprocessing function based on the template name
-        if self.template_name == 'Hermes-2':
-            preprocess_function = preprocess_mpt
-        elif self.template_name == 'internlm2-chat':
-            preprocess_function = preprocess_internlm
-        elif self.template_name == 'phi3-chat':
-            preprocess_function = preprocess_phi3
-        elif self.template_name == 'internvl2_5':
-            preprocess_function = preprocess_internvl2_5_target
-        else:
-            preprocess_function = preprocess
-        return preprocess_function
+        return get_target_preprocess_function(self.template_name)
 
     def load_image(self, image_path):
         # Load the image using tcs_loader if available, otherwise use PIL
@@ -1302,55 +1371,25 @@ class TargetGoalDataset(Dataset):
         # Build transformation function
         transform = self.get_transform()
 
-        images, num_tiles = [], []
-        num_image = len(data_item['image'])
-        for i, image_path in enumerate(data_item['image']):
-            # Merge the image path
-            # image_path = self.get_image_path(image_path)
-            image_path = self.root + image_path
-            # Load the image using tcs_loader if available, otherwise use PIL
-            image = self.load_image(image_path)[i]
-            if self.dynamic_image_size:  # If dynamic image size is enabled, preprocess the image dynamically
-                image = dynamic_preprocess(image, min_num=self.min_dynamic_patch,
-                                           max_num=max(1, self.max_dynamic_patch // num_image),
-                                           image_size=self.image_size, use_thumbnail=self.use_thumbnail)
-                images += image
-                num_tiles.append(len(image))
-            else:  # Otherwise, use the original image as a single patch
-                images.append(image)
-                num_tiles.append(1)
-        pixel_values = [transform(image) for image in images]
-        pixel_values = torch.stack(pixel_values)
-        num_patches = pixel_values.size(0)
+        # Load the image using tcs_loader if available, otherwise use PIL; frame i comes from the i-th 1 x 4 strip
+        frames = [self.load_image(self.root + image_path)[i] for i, image_path in enumerate(data_item['image'])]
 
-        # Select the appropriate preprocessing function based on the template name
-        preprocess_function = self.get_preprocess_function()
-
-        # Preprocess the conversations and generate the return dictionary
-        num_image_tokens = [self.num_image_token * num_tile for num_tile in num_tiles]
-        ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
-                                  self.tokenizer, num_image_tokens, group_by_length=self.group_by_length,
-                                  use_packed_ds=self.use_packed_ds, ds_name=self.ds_name, num_image=num_image,
-                                  **self.goal_query_kwargs)
-
-        # Calculate position_ids for packed dataset
-        position_ids = ret['attention_mask'].long().cumsum(-1) - 1
-        position_ids.masked_fill_(ret['attention_mask'] == 0, 1)
-        image_end_token_id = self.tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
-        assert (ret['input_ids'][0] == image_end_token_id).sum() == num_image, f'image tokens are truncated, this dataset is {self.ds_name}'
-
-        # Create the final return dictionary
-        ret = dict(
-            input_ids=ret['input_ids'][0],
-            labels=ret['labels'][0],
-            attention_mask=ret['attention_mask'][0],
-            position_ids=position_ids[0],
-            raw_labels=ret['raw_labels'][0],
-            ego_hist=extract_ego_history(data_item['conversations']),
-            pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long)
+        return build_target_multi_image_sample(
+            data_item['conversations'], frames,
+            tokenizer=self.tokenizer,
+            transform=transform,
+            template_name=self.template_name,
+            num_image_token=self.num_image_token,
+            dynamic_image_size=self.dynamic_image_size,
+            min_dynamic_patch=self.min_dynamic_patch,
+            max_dynamic_patch=self.max_dynamic_patch,
+            use_thumbnail=self.use_thumbnail,
+            image_size=self.image_size,
+            group_by_length=self.group_by_length,
+            use_packed_ds=self.use_packed_ds,
+            ds_name=self.ds_name,
+            num_goal_queries=self.goal_query_kwargs.get('num_goal_queries', 0),
         )
-        return ret
 
     def _enable_worker_distributed(self):
         if (
